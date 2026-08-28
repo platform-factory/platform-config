@@ -1,0 +1,30 @@
+# ADR-0010 for Crossplane packages: one rewrite rule, so every package
+# reference in this directory keeps its canonical upstream name.
+#
+# Provider packages bake in a dependency on
+# xpkg.crossplane.io/crossplane-contrib/provider-family-gcp (read from
+# provider-gcp-storage v3.0.0's own package.yaml, 2026-08-27). Without this
+# rule the package manager would resolve that dependency straight from
+# xpkg.crossplane.io — over Cloud NAT, and silently, because egress is
+# measured (C-23), not blocked. With it, packages AND their dependencies
+# come from the Artifact Registry remote (docs.crossplane.io v2.3,
+# packages/image-configs, "Rewriting image paths").
+#
+# xpkg.crossplane.io is a pass-through front for ghcr.io (registry probe in
+# the build log, 2026-08-11), so the ghcr-io remote serves the same content;
+# the path after the remote's name is upstream's, unchanged.
+#
+# Wave 0 within this Application: it must exist before any Provider does,
+# or the first pull goes upstream and the package revision records that.
+apiVersion: pkg.crossplane.io/v1beta1
+kind: ImageConfig
+metadata:
+  name: artifact-registry-mirror
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+spec:
+  matchImages:
+    - type: Prefix
+      prefix: xpkg.crossplane.io
+  rewriteImage:
+    prefix: us-central1-docker.pkg.dev/platform-factory-ref/ghcr-io

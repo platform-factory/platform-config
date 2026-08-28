@@ -1,0 +1,17 @@
+# The GCP provider family: the ProviderConfig CRD and shared controller
+# every provider-gcp-* package depends on. Declared explicitly rather than
+# left to dependency resolution in order to pin the version — the packages'
+# baked-in constraint is ">= 0.0.0", which would float to whatever is newest.
+# Same source name as the dependency they declare, so the package manager's
+# Lock recognizes this install as satisfying it (the mirror rewrite in
+# image-config.yaml happens at pull time, underneath that name).
+#
+# Wave 1: after the ImageConfig, before anything that depends on this.
+apiVersion: pkg.crossplane.io/v1
+kind: Provider
+metadata:
+  name: provider-family-gcp
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+spec:
+  package: xpkg.crossplane.io/crossplane-contrib/provider-family-gcp:v3.0.0

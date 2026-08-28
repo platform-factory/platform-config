@@ -1,0 +1,39 @@
+# Crossplane provider packages — sync wave 1 of the root app-of-apps.
+#
+# Wave 1 because everything in crossplane/providers/ is a Crossplane CRD
+# type (ImageConfig, Provider) that does not exist until the wave-0
+# crossplane Application is Healthy. That gating only holds because
+# 3-argocd restores Argo CD's health check for Application resources
+# (dropped from the built-ins in Argo CD 1.8). The retry block is the
+# backstop if that ever regresses: the sync fails on the missing CRD and
+# is retried until the CRD arrives, rather than the root sitting Degraded.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: crossplane-providers
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/platform-factory/platform-config
+    targetRevision: main
+    path: crossplane/providers
+  destination:
+    server: https://kubernetes.default.svc
+    # Providers and ImageConfigs are cluster-scoped; Argo CD still requires a
+    # destination namespace, and this one exists by wave 1.
+    namespace: crossplane-system
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - ServerSideApply=true
+    retry:
+      limit: 10
+      backoff:
+        duration: 15s
+        factor: 2
+        maxDuration: 5m
