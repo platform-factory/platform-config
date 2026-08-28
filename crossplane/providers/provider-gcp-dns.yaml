@@ -1,0 +1,13 @@
+# provider-gcp-dns: ManagedZone, RecordSet (Cloud DNS) — from the C-03 kind list
+# the M2 Compositions need (verified against provider-upjet-gcp v3.0.0's
+# CRDs and examples, build log 2026-08-11).
+#
+# Wave 2: installs only after provider-family-gcp (wave 1) is Healthy.
+apiVersion: pkg.crossplane.io/v1
+kind: Provider
+metadata:
+  name: provider-gcp-dns
+  annotations:
+    argocd.argoproj.io/sync-wave: "2"
+spec:
+  package: xpkg.crossplane.io/crossplane-contrib/provider-gcp-dns:v3.0.0

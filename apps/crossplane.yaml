@@ -1,0 +1,50 @@
+# Crossplane core — sync wave 0 of the root app-of-apps.
+#
+# The chart is vendored in this repo (charts/crossplane: upstream 2.3.5,
+# unmodified — see charts/README.md), not fetched from charts.crossplane.io
+# at sync time. Argo CD's repo-server would otherwise reach that host over
+# Cloud NAT, a second internet egress path next to the one C-23 allows (git
+# to GitHub). A chart bump is therefore a PR here, like every other change.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: crossplane
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/platform-factory/platform-config
+    targetRevision: main
+    path: charts/crossplane
+    helm:
+      releaseName: crossplane
+      valuesObject:
+        image:
+          # Chart default is xpkg.crossplane.io/crossplane/crossplane, a
+          # front for ghcr.io/crossplane/crossplane. ADR-0010: pulls ride the
+          # Artifact Registry remote over Private Google Access instead.
+          # Path structure after the remote's name is upstream's, unchanged.
+          repository: us-central1-docker.pkg.dev/platform-factory-ref/ghcr-io/crossplane/crossplane
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: crossplane-system
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      # Crossplane's CRDs are too large for client-side apply's
+      # last-applied-configuration annotation.
+      - ServerSideApply=true
+    # Backstop, not the ordering mechanism (that's the sync wave). Lets a
+    # transient failure — the cluster still settling after a rebuild —
+    # retry instead of leaving the root Degraded until a human looks.
+    retry:
+      limit: 10
+      backoff:
+        duration: 15s
+        factor: 2
+        maxDuration: 5m
