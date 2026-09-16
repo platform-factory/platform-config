@@ -146,6 +146,17 @@ spec:
   destination:
     server: https://kubernetes.default.svc
     namespace: kyverno
+  # The chart renders `metadata.labels: {}` and `metadata.annotations: {}` on
+  # its policies.kyverno.io CRDs when nothing is configured; the API server
+  # drops empty maps, and even a server-side diff reads {} vs absent as a
+  # change. Observed as permanent OutOfSync on the first M2 bring-up
+  # (2026-09-16). Ignore those two pointers on CRDs only.
+  ignoreDifferences:
+    - group: apiextensions.k8s.io
+      kind: CustomResourceDefinition
+      jsonPointers:
+        - /metadata/labels
+        - /metadata/annotations
   syncPolicy:
     automated:
       prune: true
