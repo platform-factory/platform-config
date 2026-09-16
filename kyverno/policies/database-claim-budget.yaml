@@ -39,6 +39,9 @@ metadata:
       A Cloud SQL instance is durable by design (ADR-0015), so an accidental
       one outlives the pull request that made it.
 spec:
+  # Spec-level too, for the same reason as deny-raw-managed-resources.yaml:
+  # Kyverno defaults the deprecated field to Audit and Argo CD sees drift.
+  validationFailureAction: Enforce
   # The count comes from {{request.namespace}}, which exists only on an
   # admission request; a background scan would have nothing to evaluate.
   background: false

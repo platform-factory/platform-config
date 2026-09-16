@@ -61,6 +61,13 @@ metadata:
       platform.thecloudgeek.io claim; the Composition creates the managed
       resource, so the platform owns its identity, IAM, labels and lifecycle.
 spec:
+  # Stated at the spec level AS WELL as on each rule. The spec-level field is
+  # deprecated, but Kyverno still defaults it (to Audit) and shows it in
+  # `kubectl get clusterpolicy`; on the first live run the policy read
+  # "ACTION: Audit" next to rules that said Enforce, and the defaulted field
+  # left the kyverno-policies Application permanently OutOfSync. One word
+  # here removes both.
+  validationFailureAction: Enforce
   # REQUIRED here for two independent reasons. (1) A policy whose match block
   # uses wildcards cannot run in background mode — kyverno.io docs, cluster
   # policy match/exclude, "Note". (2) The rules key off WHO made the request
@@ -97,8 +104,28 @@ spec:
               # match the provider's own config group `gcp.m.upbound.io` (no
               # leading label), so ClusterProviderConfig and ProviderConfigUsage
               # are untouched.
+              # CORRECTED ON THE FIRST LIVE TEST (2026-09-16). The original
+              # selector was "*.gcp.m.upbound.io/*/*", on the belief that
+              # Kyverno resolves a wildcard GROUP through discovery. It does
+              # not: Kyverno wrote the literal string "*.gcp.m.upbound.io"
+              # into the ValidatingWebhookConfiguration's apiGroups, and the
+              # Kubernetes API server does not glob apiGroups (only a lone
+              # "*" is special), so the rule matched nothing and a raw
+              # DatabaseInstance applied by hand was admitted — and created a
+              # real Cloud SQL instance. A concrete group with wildcard
+              # version and kind ("sql.gcp.m.upbound.io/*/*") IS expanded
+              # into a proper rule (probed live: groups=[sql.gcp.m.upbound.io]
+              # versions=[*] resources=[*]). So the installed provider groups
+              # are enumerated here, one per provider package in
+              # crossplane/providers/. Adding a provider means adding a line
+              # here — the coupling the wildcard was meant to avoid, kept
+              # explicit instead of silently absent.
               kinds:
-                - "*.gcp.m.upbound.io/*/*"
+                - "sql.gcp.m.upbound.io/*/*"
+                - "cloudplatform.gcp.m.upbound.io/*/*"
+                - "artifact.gcp.m.upbound.io/*/*"
+                - "storage.gcp.m.upbound.io/*/*"
+                - "dns.gcp.m.upbound.io/*/*"
               operations:
                 - CREATE
               # Tenant namespaces only. The label is stamped on the namespace by
@@ -163,8 +190,13 @@ spec:
       match:
         any:
           - resources:
+              # Same correction as above, for the legacy cluster-scoped family.
               kinds:
-                - "*.gcp.upbound.io/*/*"
+                - "sql.gcp.upbound.io/*/*"
+                - "cloudplatform.gcp.upbound.io/*/*"
+                - "artifact.gcp.upbound.io/*/*"
+                - "storage.gcp.upbound.io/*/*"
+                - "dns.gcp.upbound.io/*/*"
               operations:
                 - CREATE
       exclude:
