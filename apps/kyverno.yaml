@@ -158,6 +158,15 @@ spec:
       # manifest in the last-applied-configuration annotation, which the API
       # server caps at 262,144. Four CRD files exceed that outright.
       - ServerSideApply=true
+      # ServerSideDiff: diff by dry-run server-side apply, so fields the API
+      # server DEFAULTS on these CRDs (Kyverno fills in admission,
+      # emitWarning, skipBackgroundRequests, allowExistingViolations, and
+      # conversion settings on its CRDs) are not read as drift. Without it
+      # this Application sat OutOfSync forever on the first M2 bring-up
+      # (2026-09-16) with nothing actually different — and cycle.sh gates
+      # a rebuild on every Application being Synced, so cosmetic drift here
+      # would fail every future C-02 cycle.
+      - ServerSideDiff=true
     # Backstop, not the ordering mechanism (that's the sync wave). Same
     # rationale as apps/crossplane.yaml.
     retry:
