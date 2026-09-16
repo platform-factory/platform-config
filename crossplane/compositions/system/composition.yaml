@@ -288,6 +288,23 @@ spec:
             # No readiness annotation: function-auto-ready treats a Namespace as
             # ready the moment it exists.
 
+            {{- /*
+              ORDERING GATE — everything below exists inside the namespace
+              above, or grants on it, and none of it can be applied before the
+              Namespace object exists. Crossplane applies desired composed
+              resources in map order and stops at the FIRST apply error, so
+              without this gate every reconcile of a new System died on a
+              different namespaced object ("namespaces svc-hello not found" on
+              "gsa", then on "registry-writer", ...) until, by chance, the
+              Namespace happened to be applied first. Observed live on the M2
+              bring-up, 2026-09-16, on the very first System. The fix is the
+              same shape the Database Composition uses for its GRANT Job: emit
+              only what can exist now, and let the next reconcile — triggered by
+              the Namespace being created — emit the rest. Two passes,
+              deterministic, instead of N passes, probabilistic.
+            */ -}}
+            {{- if dig "resources" "namespace" "" .observed }}
+
             ---
             # ================================================================
             # The quota, from the size class.
@@ -971,6 +988,8 @@ spec:
               size: {{ $size | quote }}
               project: {{ $project | quote }}
               region: {{ $region | quote }}
+
+            {{- end }}{{- /* end of the ordering gate: the namespace is observed */}}
 
             ---
             # ================================================================
