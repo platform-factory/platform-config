@@ -1,0 +1,76 @@
+# The composition functions the M2 Compositions run.
+#
+# Crossplane v2 has no native patch-and-transform engine: a Composition is a
+# pipeline of steps, and each step names a Function package that must already
+# be installed. These three are the whole toolkit for M2:
+#
+#   function-go-templating      renders every composed resource from a Go
+#                               template, including the native Kubernetes
+#                               kinds (Namespace, ResourceQuota, RoleBinding,
+#                               ServiceAccount, Secret, ConfigMap, Job) and
+#                               the Argo AppProject/Application. Crossplane v2
+#                               composes native kinds directly — no
+#                               provider-kubernetes Object wrapper.
+#   function-environment-configs merges environment.yaml into the pipeline
+#                               context so templates read projectID/orgDomain/
+#                               network from one place (ADR-0012 §3).
+#   function-auto-ready         last step in every pipeline: marks a composed
+#                               resource ready once it exists and its own
+#                               health check or Ready condition says so.
+#
+# function-patch-and-transform is deliberately NOT installed. Everything
+# ADR-0012/0013/0014 asks for is expressible in go-templating, and an unused
+# Function is a pod, a package revision and a CVE surface for nothing.
+#
+# PACKAGE NAMES STAY CANONICAL. These keep their xpkg.crossplane.io names so
+# the single ImageConfig in ../providers/image-config.yaml rewrites them to
+# the ghcr-io Artifact Registry remote, exactly as it does for the provider
+# packages — ADR-0010, one rule, no per-package special-casing. That works
+# because xpkg.crossplane.io is a pass-through front for ghcr.io: a manifest
+# request to xpkg.crossplane.io answers 401 with
+# `www-authenticate: Bearer realm="https://ghcr.io/token", service="ghcr.io"`,
+# and a token minted at ghcr.io then serves the same digest from both hosts
+# (probed 2026-09-16, same method as the M1 provider-package probe).
+#
+# TAGS. Each verified 2026-09-16 by an anonymous manifest fetch against
+# ghcr.io/crossplane-contrib/<name>:<tag> — all HTTP 200.
+#
+# function-auto-ready is pinned to v0.6.9, NOT to v0.7.0, and the ordering is
+# the reason to say so: v0.7.0 is the higher tag (2026-06-24) but the
+# maintainers went back to the 0.6 line afterwards and shipped v0.6.7, v0.6.8
+# and v0.6.9 (2026-09-15) as security-only bumps of the Go stdlib,
+# golang.org/x/{net,text} and google.golang.org/grpc. v0.7.0 carries none of
+# them. Its only additions are a `ttl` input and an alpha CEL health-check
+# gate, neither of which M2 uses — the composition's own
+# `gotemplating.fn.crossplane.io/ready` annotation covers every kind that has
+# no Ready condition. Taking the higher tag here would mean taking three
+# months of unfixed CVEs to gain nothing. Re-check at the next bump: if 0.7.x
+# picks the fixes up, that is the line to move to.
+#
+# metadata.name is the operator's choice and is what a Composition's
+# pipeline[].functionRef.name must match exactly. These are the bare upstream
+# names; the Compositions in ../compositions use them verbatim.
+---
+apiVersion: pkg.crossplane.io/v1
+kind: Function
+metadata:
+  name: function-go-templating
+spec:
+  package: xpkg.crossplane.io/crossplane-contrib/function-go-templating:v0.12.5
+---
+apiVersion: pkg.crossplane.io/v1
+kind: Function
+metadata:
+  name: function-environment-configs
+spec:
+  # v0.8.0 shipped 2026-09-16 — the same day this was pinned — changing how
+  # FromEnvironmentFieldPath selectors resolve. Zero soak time, and M2 uses
+  # only `type: Reference`, so the newer behaviour buys nothing here.
+  package: xpkg.crossplane.io/crossplane-contrib/function-environment-configs:v0.7.5
+---
+apiVersion: pkg.crossplane.io/v1
+kind: Function
+metadata:
+  name: function-auto-ready
+spec:
+  package: xpkg.crossplane.io/crossplane-contrib/function-auto-ready:v0.6.9

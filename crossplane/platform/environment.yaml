@@ -1,0 +1,78 @@
+# The per-environment constants a Composition is not allowed to hardcode.
+#
+# WHY. ADR-0012 §3 resolves a team to a group by convention — team `payments`
+# is `payments@<org-domain>` — and says the domain "comes from the
+# per-environment EnvironmentConfig the research recipe already calls for",
+# precisely so there is no second file mapping teams to groups. The same
+# argument covers the project, the region, the VPC self link, and the
+# ADR-0010 registry remotes: a second environment of this platform differs
+# from this one in exactly these values, and a Composition that spells them
+# inline is a Composition that has to be forked to move.
+#
+# Read by the Compositions through function-environment-configs, which merges
+# the selected configs into the pipeline context under the well-known key
+# `apiextensions.crossplane.io/environment`; a go-templating step then reads
+# e.g. `index .context "apiextensions.crossplane.io/environment" "orgDomain"`.
+#
+# Schema verified 2026-09-16 against
+# https://raw.githubusercontent.com/crossplane/crossplane/v2.3.5/cluster/crds/apiextensions.crossplane.io_environmentconfigs.yaml
+#   - apiextensions.crossplane.io/v1beta1, kind EnvironmentConfig, scope: Cluster
+#   - `data` is a TOP-LEVEL field (a sibling of metadata), NOT spec.data. An
+#     EnvironmentConfig written with spec.data silently carries nothing.
+#   - data's values are x-kubernetes-preserve-unknown-fields, so any JSON type
+#     is legal; these are all strings, which is what the templates want.
+#
+# Cluster-scoped, and that is fine for the Namespaced `Database` XR too: the
+# required-resource fetcher Crossplane uses for environment lookups applies no
+# scope restriction (crossplane v2.3 internal/xfn/required_resources.go, read
+# in the M2 composition-toolkit spike 2026-09-16).
+#
+# EVERY VALUE HERE IS ALSO WRITTEN DOWN IN TERRAFORM. This file is the
+# read-side copy; platform-bootstrap is the write side (0-foundation/main.tf
+# for the project, registry.tf for the remotes, 1-network for the VPC). They
+# are kept in step by review, not by a mechanism — if that ever hurts, the
+# fix is to have layer 3 render this file, not to delete it.
+apiVersion: apiextensions.crossplane.io/v1beta1
+kind: EnvironmentConfig
+metadata:
+  name: platform
+data:
+  # 0-foundation: the one project everything in this reference build lives in.
+  projectID: platform-factory-ref
+
+  # The single region. The `Database` XRD's region enum is deliberately wider
+  # (us-central1, us-east1) to prove the schema is not the region's owner;
+  # this is the default everything else uses.
+  region: us-central1
+
+  # ADR-0012 §3: `<team>@<orgDomain>` is the group. The Google Workspace
+  # domain, not a DNS zone the platform manages.
+  orgDomain: thecloudgeek.io
+
+  # The Git host, scheme included and no trailing slash. ADR-0012 §6 gives a
+  # System only `spec.owner.repo` as `org/name`, so something has to supply
+  # the rest of the URL for the tenant's AppProject sourceRepos and its Argo
+  # Application repoURL. That something is this key, not a literal in the
+  # Composition: a GitHub Enterprise install (or a move to GitLab) is the
+  # exact case this file exists for. Compositions read it as
+  # `dig "gitBase" "https://github.com" $env` and build
+  # `{{ $gitBase }}/{{ .spec.owner.repo }}`.
+  gitBase: https://github.com
+
+  # The VPC self link in the form Cloud SQL's privateNetwork wants
+  # (projects/<project>/global/networks/<name>). 1-network owns the VPC; the
+  # Private Services Access range peered onto it is what makes a private-IP
+  # DatabaseInstance reachable at all, so a Database claim reconciling before
+  # 1-network's PSA apply sits in a NETWORK_NOT_PEERED loop rather than
+  # failing loudly.
+  network: projects/platform-factory-ref/global/networks/platform-factory-ref
+
+  # ADR-0010 image plane. `registryBase` is where per-System repositories are
+  # created (the System Composition's RegistryRepository) and where service
+  # images are pushed; the two remotes are pull-through caches, never push
+  # targets. Google-hosted images (gcr.io/cloud-sql-connectors/cloud-sql-proxy,
+  # for one) pull directly over Private Google Access and need no remote.
+  registryLocation: us-central1
+  registryBase: us-central1-docker.pkg.dev/platform-factory-ref
+  dockerHubRemote: us-central1-docker.pkg.dev/platform-factory-ref/docker-hub
+  ghcrRemote: us-central1-docker.pkg.dev/platform-factory-ref/ghcr-io

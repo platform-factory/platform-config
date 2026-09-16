@@ -1,0 +1,68 @@
+# The tenants — sync wave 4 of the root app-of-apps, and the only child
+# Application whose source is a DIFFERENT repository.
+#
+# WHY A SEPARATE REPO. ADR-0001: the repo boundary is the approval boundary.
+# Everything in platform-config is the platform team changing the platform;
+# `systems` is the platform team onboarding a tenant. Different reviewers,
+# different blast radius, different rate of change — so a different repo, and
+# claim C-05 ("one YAML per tenant") is measured in lines of exactly that repo.
+#
+# WAVE 4, after compositions (wave 3). A `System` is a kind that does not exist
+# until the XRD in wave 3 is Established. If this synced earlier, every tenant
+# file would fail with "no matches for kind System" — which the retry block
+# below would eventually recover from, but slowly and with a Degraded root in
+# between. The wave is the ordering; the retry is the backstop.
+#
+# HEALTH. Argo CD 3.4.6 ships no built-in health check for
+# platform.thecloudgeek.io — its wildcard built-ins key off group suffixes
+# `*.crossplane.io` and `*.upbound.io`, and ours is neither. `3-argocd` adds a
+# Lua check for System and Database so that "Healthy" here means the XR reports
+# Ready, not merely that the object was created. Without it this Application
+# would go Healthy the instant the YAML applied and C-05's merge-to-usable
+# stopwatch would measure nothing.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: systems
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "4"
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/platform-factory/systems
+    targetRevision: main
+    # One file per tenant. Adding a tenant is adding a file here and nothing
+    # else — no change to this Application, no change to platform-config.
+    path: tenants
+  destination:
+    server: https://kubernetes.default.svc
+    # Systems are cluster-scoped, so this namespace is only Argo CD's required
+    # placeholder for the destination; nothing is created in `argocd` by this
+    # Application. The tenant namespaces are created by the Composition, which
+    # is why no CreateNamespace sync option appears here.
+    namespace: argocd
+  syncPolicy:
+    automated:
+      prune: true
+      # selfHeal matters more here than anywhere else in this repo: it is what
+      # makes a hand-edited tenant — someone widening a quota with `kubectl
+      # edit` — revert to what the reviewed file says.
+      selfHeal: true
+      #
+      # PRUNE AND DURABLE RESOURCES. Deleting a tenant's file prunes its System
+      # XR, which deletes the namespace, the RBAC, the Argo project and the
+      # Google service account — but NOT the Artifact Registry repository or
+      # any database. Those are composed with management policies that omit
+      # Delete (ADR-0015 §1), so they are observed, created and updated by the
+      # platform and removed only by a human following the runbook in ADR-0015
+      # §5. That asymmetry is the point: a mistaken `git rm` costs a tenant its
+      # namespace, which is rebuildable, and never its data.
+    syncOptions:
+      - ServerSideApply=true
+    retry:
+      limit: 10
+      backoff:
+        duration: 15s
+        factor: 2
+        maxDuration: 5m

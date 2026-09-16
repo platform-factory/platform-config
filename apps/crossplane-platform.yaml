@@ -1,0 +1,66 @@
+# Crossplane's platform configuration — sync wave 2 of the root app-of-apps.
+#
+# Everything in crossplane/platform/ is a thing Crossplane needs BEFORE the
+# first XRD can usefully reconcile, and after the provider packages are
+# installed:
+#
+#   provider-config.yaml  the one ClusterProviderConfig every managed resource
+#                         defaults to. Its CRD (gcp.m.upbound.io) ships with
+#                         provider-family-gcp, so this Application cannot
+#                         validate until the wave-1 crossplane-providers
+#                         Application is Healthy — which is the whole reason
+#                         for wave 2.
+#   environment.yaml      the per-environment constants the Compositions read
+#                         (ADR-0012 §3). Its CRD comes from Crossplane core.
+#   functions.yaml        the composition functions. Core CRDs only, but the
+#                         packages are pulled through the ImageConfig mirror
+#                         rule that installs in wave 1, so they belong on this
+#                         side of that boundary too.
+#   rbac.yaml             Crossplane's own permission to compose namespaces,
+#                         quotas, role bindings, jobs and Argo objects. Pure
+#                         Kubernetes RBAC, no CRD dependency — but it must be
+#                         in place before the first System XR in wave 4, and
+#                         this is the earliest wave where the rest fits.
+#
+# Wave 2 rather than folding into crossplane-providers: these are the
+# platform's own configuration, not the package set, and separating them means
+# a ProviderConfig change does not re-sync (and possibly re-pull) five provider
+# packages. Kyverno also sits at wave 2, in parallel; compositions are wave 3
+# and the systems repo wave 4.
+#
+# The wave gating only works because 3-argocd restores Argo CD's health check
+# for Application resources; the retry block is the backstop if that regresses
+# or if the family provider is merely slow — the sync fails on the missing
+# ClusterProviderConfig CRD and is retried rather than leaving the root
+# Degraded until a human looks.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: crossplane-platform
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "2"
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/platform-factory/platform-config
+    targetRevision: main
+    path: crossplane/platform
+  destination:
+    server: https://kubernetes.default.svc
+    # Every object in this directory is cluster-scoped (ClusterProviderConfig,
+    # EnvironmentConfig, Function, ClusterRole). Argo CD still requires a
+    # destination namespace, and crossplane-system exists by wave 0.
+    namespace: crossplane-system
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - ServerSideApply=true
+    retry:
+      limit: 10
+      backoff:
+        duration: 15s
+        factor: 2
+        maxDuration: 5m

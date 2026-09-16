@@ -1,0 +1,138 @@
+# Cloud identity for the provider pods — the "floor" the M2 readiness walk
+# found every C-05..C-08 test standing on (m2-paved-road.md, "The floor every
+# test stands on", item 1).
+#
+# WHY THIS FILE EXISTS. A provider pod gets its Google credentials from
+# Workload Identity: layer 0 grants roles/iam.workloadIdentityUser on the
+# shared Google service account to the member
+#   serviceAccount:platform-factory-ref.svc.id.goog[crossplane-system/<ksa>]
+# and the Kubernetes service account carries a matching
+# iam.gke.io/gcp-service-account annotation. Both halves name the KSA, so the
+# KSA name has to be knowable in Terraform and stable over time.
+#
+# By default it is neither. Crossplane's package manager names the KSA after
+# the ProviderRevision (provider-gcp-sql-<revision-hash>), so every version
+# bump mints a new name, silently invalidates the layer-0 binding, and the
+# provider starts failing GCP calls with no manifest having changed.
+# A DeploymentRuntimeConfig pins the name instead:
+#   "Setting the serviceAccountTemplate.metadata.name field will override the
+#    name of service account created by the package manager"
+# (docs.crossplane.io/v2.3, packages/providers, read 2026-09-16).
+#
+# TWO RULES FROM THAT SAME PAGE, BOTH LOAD-BEARING HERE:
+#
+# 1. Never name one of these "default". Crossplane's init container creates a
+#    DeploymentRuntimeConfig called `default`, and Provider.spec.runtimeConfigRef
+#    itself defaults to {name: default} (verified 2026-09-16 against
+#    crossplane v2.3.5 cluster/crds/pkg.crossplane.io_providers.yaml, which
+#    carries `default: {name: default}` on that field). Editing `default`
+#    would re-point every provider at one KSA.
+# 2. One distinct KSA per package. "A common mistake is configuring the same
+#    service account for multiple packages in this way which ends up causing
+#    frequent reconciliation loops and loads on the API server." Five
+#    providers, five KSAs, one shared Google service account behind them —
+#    the split that ADR-0013 §6 and the walk's floor describe.
+#
+# Crossplane creates and owns these ServiceAccount objects. This repo must NOT
+# also create them, or the two controllers fight; only the GSA-side IAM
+# binding is Terraform's (0-foundation/iam.tf).
+#
+# Schema verified 2026-09-16 against crossplane v2.3.5
+# cluster/crds/pkg.crossplane.io_deploymentruntimeconfigs.yaml: kind
+# DeploymentRuntimeConfig, group pkg.crossplane.io, version v1beta1, scope
+# Cluster, spec.serviceAccountTemplate.metadata = {name, labels, annotations}.
+#
+# provider-family-gcp gets no runtime config: it owns the ProviderConfig CRDs
+# and the shared config controller, and makes no GCP resource calls of its
+# own, so it needs no cloud identity. If that ever changes it gets its own
+# entry here and its own binding in layer 0 — not a share of one of these.
+#
+# Wave 0 within the crossplane-providers Application, next to the ImageConfig:
+# the runtime config has to exist before the Provider that references it
+# installs. If it does not, the revision's runtime reconcile fails outright
+# with "cannot get referenced deployment runtime config" and the revision
+# reports RuntimeUnhealthy — no Deployment and no service account are built at
+# all (verified 2026-09-16 against crossplane v2.3.5
+# internal/controller/pkg/runtime/reconciler.go: builderOptions() does a plain
+# client.Get on the referenced DeploymentRuntimeConfig and wraps the error as
+# errGetRuntimeConfig; the caller marks RuntimeUnhealthy and returns). So the
+# symptom of getting this wrong is a provider with no pod and a Degraded
+# crossplane-providers Application, not a running pod missing its annotation.
+# It self-heals — the same reconciler Watches DeploymentRuntimeConfig, so the
+# revision is re-enqueued the moment this file syncs — but wave 0 keeps the
+# first sync clean rather than relying on that.
+#
+# The revision-named service account (runtime.go,
+# ServiceAccountWithOptionalName(revision.GetName())) is only the fallback for
+# a Provider whose runtime config pins no name — which is exactly the default
+# this file exists to replace.
+---
+apiVersion: pkg.crossplane.io/v1beta1
+kind: DeploymentRuntimeConfig
+metadata:
+  name: provider-gcp-storage
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+spec:
+  serviceAccountTemplate:
+    metadata:
+      name: provider-gcp-storage
+      annotations:
+        # The impersonation half of Workload Identity. Paired with
+        # roles/iam.workloadIdentityUser on this GSA for
+        # serviceAccount:platform-factory-ref.svc.id.goog[crossplane-system/provider-gcp-storage]
+        # in 0-foundation/iam.tf — "Both the IAM allow policy and the
+        # annotation are required" (GKE Workload Identity how-to, 2026-09-16).
+        iam.gke.io/gcp-service-account: crossplane-provider-gcp@platform-factory-ref.iam.gserviceaccount.com
+---
+apiVersion: pkg.crossplane.io/v1beta1
+kind: DeploymentRuntimeConfig
+metadata:
+  name: provider-gcp-sql
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+spec:
+  serviceAccountTemplate:
+    metadata:
+      name: provider-gcp-sql
+      annotations:
+        iam.gke.io/gcp-service-account: crossplane-provider-gcp@platform-factory-ref.iam.gserviceaccount.com
+---
+apiVersion: pkg.crossplane.io/v1beta1
+kind: DeploymentRuntimeConfig
+metadata:
+  name: provider-gcp-cloudplatform
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+spec:
+  serviceAccountTemplate:
+    metadata:
+      name: provider-gcp-cloudplatform
+      annotations:
+        iam.gke.io/gcp-service-account: crossplane-provider-gcp@platform-factory-ref.iam.gserviceaccount.com
+---
+apiVersion: pkg.crossplane.io/v1beta1
+kind: DeploymentRuntimeConfig
+metadata:
+  name: provider-gcp-artifact
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+spec:
+  serviceAccountTemplate:
+    metadata:
+      name: provider-gcp-artifact
+      annotations:
+        iam.gke.io/gcp-service-account: crossplane-provider-gcp@platform-factory-ref.iam.gserviceaccount.com
+---
+apiVersion: pkg.crossplane.io/v1beta1
+kind: DeploymentRuntimeConfig
+metadata:
+  name: provider-gcp-dns
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+spec:
+  serviceAccountTemplate:
+    metadata:
+      name: provider-gcp-dns
+      annotations:
+        iam.gke.io/gcp-service-account: crossplane-provider-gcp@platform-factory-ref.iam.gserviceaccount.com

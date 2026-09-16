@@ -1,0 +1,53 @@
+# The cloud credential every managed resource uses — one object, cluster-wide.
+#
+# WHY ONE OBJECT AND NOT ONE PER TENANT. Crossplane v2's namespaced managed
+# resources (the `*.gcp.m.upbound.io` kinds both M2 Compositions compose)
+# carry a `spec.providerConfigRef` that DEFAULTS to
+#   {kind: ClusterProviderConfig, name: default}
+# (verified 2026-09-16 by reading spec.forProvider's sibling field in
+# provider-upjet-gcp v3.0.0's package/crds/sql.gcp.m.upbound.io_databaseinstances.yaml).
+# So a single cluster-scoped object named exactly `default` is picked up by
+# every managed resource in every tenant namespace, with no patch in any
+# Composition. The alternative the group also offers — `gcp.m.upbound.io/v1beta1
+# ProviderConfig`, which is Namespaced — would mean composing one of these into
+# every tenant namespace and is the thing this avoids.
+#
+# THE KIND IS NOT THE ONE IN THE OLD DOCS. `gcp.upbound.io/v1beta1
+# ProviderConfig` (no `.m.`) is the legacy cluster-scoped family object that
+# serves the legacy cluster-scoped managed resources. Nothing in M2 uses those
+# kinds, so it is deliberately absent; adding it would create a second
+# credential object that looks authoritative and is never read.
+#
+# Schema verified 2026-09-16 against
+# https://raw.githubusercontent.com/crossplane-contrib/provider-upjet-gcp/v3.0.0/package/crds/gcp.m.upbound.io_clusterproviderconfigs.yaml
+#   - kind ClusterProviderConfig, group gcp.m.upbound.io, version v1beta1,
+#     scope: Cluster
+#   - spec.required = [credentials, projectID]. projectID is REQUIRED at
+#     v3.0.0 — it was optional in older releases, and omitting it here fails
+#     admission, not reconcile.
+#   - credentials.source enum includes InjectedIdentity.
+#   - there is NO region field, which is why every composed resource has to
+#     spell out its own region/location.
+#
+# WHAT InjectedIdentity MEANS HERE. "Use whatever identity the pod already
+# has." The pod's Kubernetes service account is pinned by the
+# DeploymentRuntimeConfigs in ../providers/runtime-configs.yaml and annotated
+# to crossplane-provider-gcp@platform-factory-ref.iam.gserviceaccount.com,
+# whose roles are granted in platform-bootstrap 0-foundation/iam.tf. No key,
+# no Secret, nothing to rotate — which is the whole reason ADR-0013 §6 could
+# put grant power on that identity and bound it with an IAM Condition instead
+# of worrying about where a key file lives.
+#
+# The family package ships these CRDs and all five service providers share
+# them, so one object covers storage, sql, cloudplatform, artifact and dns.
+apiVersion: gcp.m.upbound.io/v1beta1
+kind: ClusterProviderConfig
+metadata:
+  # `default` is not a label of convenience: it is the name the managed
+  # resources' own default providerConfigRef points at. Renaming this means
+  # patching providerConfigRef into every composed resource.
+  name: default
+spec:
+  projectID: platform-factory-ref
+  credentials:
+    source: InjectedIdentity

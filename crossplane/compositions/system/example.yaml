@@ -1,0 +1,38 @@
+# An example System, for `crossplane render` and for reading.
+#
+# THIS FILE IS NOT APPLIED TO THE CLUSTER. apps/compositions.yaml excludes
+# every `example.yaml` under crossplane/compositions/ from its sync, because
+# applying this one would create a second, competing `svc-hello` System
+# alongside the real one the `systems` repo owns. If you add an example to
+# another Composition directory, name it `example.yaml` too and the exclusion
+# already covers it.
+#
+# Render it offline, from this directory, with no cluster (it pulls the three
+# function images and runs them in Docker):
+#
+#   crossplane render example.yaml composition.yaml ../../platform/functions.yaml
+#
+# The EnvironmentConfig is not available to an offline render, so the
+# Composition's per-key fallbacks are what supply the project, region and org
+# domain — which is also why they exist. To render against the real values,
+# add crossplane/platform/environment.yaml with --extra-resources.
+#
+# The real tenant file — same five fields, more comments — lives at
+# systems/tenants/svc-hello.yaml.
+apiVersion: platform.thecloudgeek.io/v1alpha1
+kind: System
+metadata:
+  # 6-30 characters, lowercase letters, digits and dashes, starting with a
+  # letter: the intersection of a Kubernetes namespace name, an Artifact
+  # Registry repository id, and a GCP service account id. The XRD enforces it.
+  name: svc-hello
+spec:
+  owner:
+    # Resolves to payments@thecloudgeek.io by convention (ADR-0012 §3).
+    team: payments
+    # Becomes https://github.com/platform-factory/svc-hello, path k8s/.
+    repo: platform-factory/svc-hello
+  tier: standard
+  securityTier: internal
+  # S: 2 CPU / 4Gi requested, 4 CPU / 8Gi limit, 20 pods.
+  size: S

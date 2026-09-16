@@ -1,0 +1,183 @@
+# The reality gate behind "app teams create XRs, not cloud resources"
+# (ADR-0014 §3, ADR-0001's rule that an intent gate is paired with a reality
+# gate).
+#
+# WHY THIS IS LOAD-BEARING, stated precisely, because the obvious version of
+# the story is wrong. Crossplane's RBAC manager does NOT aggregate managed
+# resources into Kubernetes' built-in `admin`/`edit` ClusterRoles: it uses its
+# own label, `rbac.crossplane.io/aggregate-to-{admin,edit}`, and the chart
+# carries zero `rbac.authorization.k8s.io/aggregate-to-*` labels (verified
+# 2026-09-16 by grep over charts/crossplane/templates/rbac-manager-managed-clusterroles.yaml
+# at 2.3.5). So a RoleBinding to the built-in `admin` alone would give a team
+# neither raw managed resources NOR the `Database` claim the paved road is
+# built around.
+#
+# Which is exactly why the System Composition also binds the team to
+# `crossplane-edit` — and `crossplane-edit` aggregates the per-ProviderRevision
+# roles the RBAC manager writes, which carry verbs `*` on EVERY managed-resource
+# kind the GCP providers own. That binding is what opens the door this policy
+# closes: with it and without this policy, a developer could `kubectl create` a
+# raw `DatabaseInstance` or `Bucket` in their own namespace and own a cloud
+# resource the platform never sees — no cost label, no IAM story, no lifecycle.
+#
+# It is also the twin of the tenant AppProject's `namespaceResourceBlacklist`:
+# that one catches a managed resource arriving through git (Argo CD's
+# application-controller is not Crossplane, so it is denied here too), this one
+# catches `kubectl`.
+#
+# WHY `kyverno.io/v1 ClusterPolicy` AND NOT `policies.kyverno.io ValidatingPolicy`,
+# given that chart 3.9.1's values.yaml (lines 111-114, read 2026-09-16) marks
+# this whole API group deprecated and slated for removal, and installs the
+# successor CRDs alongside it. The successor cannot express this rule. Its
+# `matchConstraints` follows Kubernetes' admission-registration semantics, where
+# `apiGroups` accepts a literal group name or the single token `*` meaning ALL
+# groups — "If '*' is present, the length of the slice must be one" (read from
+# the vendored policies.kyverno.io_validatingpolicies.yaml CRD, 2026-09-16).
+# There is no `*.gcp.m.upbound.io` form. Writing this as a ValidatingPolicy
+# would mean either enumerating every provider group by hand and re-editing on
+# every new provider, or registering `apiGroups: ["*"]` — a webhook on every
+# resource in the cluster — and filtering in CEL. ClusterPolicy's kind selector
+# wildcard-matches the group segment and is then resolved through discovery to
+# concrete GVRs, which is exactly the shape this rule needs (see the match block
+# below). The same group deprecation applies to database-claim-budget.yaml.
+#
+# Migration trigger: the first Kyverno release whose notes schedule removal of
+# `kyverno.io/v1`. By then the check to make is whether `apiGroups` has grown a
+# partial-wildcard form, or whether enumerating the five installed GCP provider
+# groups has become acceptable. Recorded in charts/README.md too, because the
+# upgrade procedure replaces the chart directory wholesale.
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: deny-raw-managed-resources
+  annotations:
+    policies.kyverno.io/title: Cloud resources come from claims, not kubectl
+    policies.kyverno.io/category: Platform Factory
+    policies.kyverno.io/severity: high
+    policies.kyverno.io/subject: Managed resources
+    policies.kyverno.io/description: >-
+      Only Crossplane's own composition engine may create provider managed
+      resources. A developer asks for cloud infrastructure through a
+      platform.thecloudgeek.io claim; the Composition creates the managed
+      resource, so the platform owns its identity, IAM, labels and lifecycle.
+spec:
+  # REQUIRED here for two independent reasons. (1) A policy whose match block
+  # uses wildcards cannot run in background mode — kyverno.io docs, cluster
+  # policy match/exclude, "Note". (2) The rules key off WHO made the request
+  # (`exclude.subjects`), and request user info exists only on an admission
+  # review; a background scan would have nothing to evaluate.
+  background: false
+  webhookConfiguration:
+    # ADR-0014 §3: Fail for the reality gate, so that Kyverno being down blocks
+    # managed-resource creation rather than quietly waving it through. This is
+    # also the chart/CRD default ("Defaults to Fail", read from the vendored
+    # ClusterPolicy CRD 2026-09-16); written out because the ADR makes it a
+    # decision rather than an inherited default. Scoped to the two GCP provider
+    # groups below and nothing else, so a Kyverno outage blocks those creates
+    # and no other workload.
+    failurePolicy: Fail
+  rules:
+    # ---------------------------------------------------------------------
+    - name: no-raw-managed-resources-in-tenant-namespaces
+      match:
+        any:
+          - resources:
+              # Verified 2026-09-16 against kyverno v1.19.1: the GROUP segment
+              # of a kind selector is wildcard-matched (pkg/utils/match/kind.go
+              # CheckKind -> ext/wildcard -> IGLOU-EU/go-wildcard, whose `*`
+              # crosses dots), and the selector is resolved through API
+              # discovery to CONCRETE GVRs before Kyverno writes the webhook
+              # rule (pkg/clients/dclient/discovery.go FindResources). So this
+              # does not register a cluster-wide apiGroups:["*"] webhook — it
+              # registers exactly the GCP provider groups that are installed.
+              # Form is group/version/kind.
+              #
+              # `*.gcp.m.upbound.io` is Crossplane v2's NAMESPACED managed
+              # resources, which is what both M2 Compositions use. It does not
+              # match the provider's own config group `gcp.m.upbound.io` (no
+              # leading label), so ClusterProviderConfig and ProviderConfigUsage
+              # are untouched.
+              kinds:
+                - "*.gcp.m.upbound.io/*/*"
+              operations:
+                - CREATE
+              # Tenant namespaces only. The label is stamped on the namespace by
+              # the System Composition, so crossplane-system (where the
+              # providers' own objects live) and kube-* are out of scope by
+              # construction — no allow-list to maintain.
+              namespaceSelector:
+                matchExpressions:
+                  - key: platform.thecloudgeek.io/system
+                    operator: Exists
+      exclude:
+        any:
+          # Crossplane's composition engine creates composed resources as its
+          # core service account, so every managed resource that came from a
+          # claim arrives under this identity and is allowed. Verified
+          # 2026-09-16: pkg/utils/match/subjects.go builds
+          # "system:serviceaccount:<namespace>:<name>" and wildcard-matches it
+          # against request.userInfo.username.
+          #
+          # Nothing else is excluded on purpose. Argo CD's
+          # application-controller is NOT Crossplane: a managed resource
+          # committed to a team's k8s/ directory is denied here as well as by
+          # the tenant AppProject's blacklist.
+          - subjects:
+              - kind: ServiceAccount
+                name: crossplane
+                namespace: crossplane-system
+      validate:
+        # spec.validationFailureAction is deprecated in 1.19.x — the CRD's own
+        # text is "Deprecated, use validationFailureAction under the validate
+        # rule instead" (read from the vendored CRD, 2026-09-16). This is that
+        # field.
+        failureAction: Enforce
+        message: >-
+          Cloud resources are not created by hand here. Ask for what you need
+          with a platform.thecloudgeek.io claim — a Database, for example — and
+          the platform's Composition creates the cloud resource for you, with
+          its identity, IAM grants, labels and lifecycle attached. Creating the
+          managed resource directly would give you a cloud resource the platform
+          cannot see, bill, or clean up. See docs/paved-road.md.
+        # An empty deny block is an UNCONDITIONAL deny: the match/exclude blocks
+        # above are the entire condition. Verified 2026-09-16 by reading kyverno
+        # v1.19.1 — pkg/engine/utils/utils.go TransformConditions turns nil into
+        # an empty AnyAllConditions, and pkg/engine/variables/evaluate.go
+        # evaluateAnyAllConditionsWithContext returns true when both `any` and
+        # `all` are nil.
+        deny: {}
+
+    # ---------------------------------------------------------------------
+    - name: no-raw-cluster-scoped-managed-resources
+      # ADR-0014 §3 names both provider groups. The legacy, cluster-scoped
+      # family (`*.gcp.upbound.io`, no `.m.`) has no namespace, so the
+      # namespaceSelector above cannot reach it and "in a tenant namespace" is
+      # not a thing that can be said about it. This rule is the cluster-wide
+      # half, so the ADR's sentence is true of both families.
+      #
+      # Nothing in M2 creates these — both Compositions use the namespaced
+      # `.m.` variants, which is also what keeps one managed-resource family
+      # across the whole platform. The rule therefore costs nothing today and
+      # closes the door if a future Composition, or a hand-run kubectl, reaches
+      # for the legacy family.
+      match:
+        any:
+          - resources:
+              kinds:
+                - "*.gcp.upbound.io/*/*"
+              operations:
+                - CREATE
+      exclude:
+        any:
+          - subjects:
+              - kind: ServiceAccount
+                name: crossplane
+                namespace: crossplane-system
+      validate:
+        failureAction: Enforce
+        message: >-
+          Cloud resources are not created by hand here, and this cluster-scoped
+          managed resource would not belong to any system. Ask for what you need
+          with a platform.thecloudgeek.io claim in your own namespace and let the
+          platform's Composition create the cloud resource. See docs/paved-road.md.
+        deny: {}

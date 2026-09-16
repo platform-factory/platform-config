@@ -1,0 +1,1001 @@
+# The System recipe — everything one tenant gets, from five fields.
+#
+# ============================================================================
+# WHY THIS FILE IS SHAPED THE WAY IT IS
+# ============================================================================
+#
+# The claim (C-05) is that onboarding a tenant is one YAML file. That is only
+# true if a single recipe can reach every place a tenant has to exist: a
+# Kubernetes namespace, Argo CD's own namespace, and Google Cloud. This
+# Composition is that reach, in one pipeline, and its whole design follows
+# from three mechanics:
+#
+# 1. A CLUSTER-SCOPED XR CAN COMPOSE NAMESPACED OBJECTS IN ANY NAMESPACE.
+#    That is what lets one recipe put an AppProject into `argocd` and a
+#    RoleBinding into the tenant's namespace. The reverse is forbidden — a
+#    Namespaced XR is confined to its own namespace — which is why `System` is
+#    Cluster-scoped and `Database` is not. (crossplane v2.3
+#    composition_render.go, read 2026-09-16.)
+#
+# 2. CROSSPLANE V2 COMPOSES NATIVE KUBERNETES OBJECTS DIRECTLY. No
+#    provider-kubernetes `Object` wrapper, no second provider to install. The
+#    only cost is RBAC: Crossplane's service account must hold the verbs, which
+#    is what `crossplane/platform/rbac.yaml` grants.
+#
+# 3. THE TEMPLATE IS THE RECIPE. function-go-templating renders every object
+#    from the XR in one pass, so "what does a tenant get" is answerable by
+#    reading one file top to bottom rather than by diffing a patch list.
+#
+# ----------------------------------------------------------------------------
+# THE TEAM FIELD: what changes when ownership moves (ADR-0012 §4, ADR-0013 §5)
+# ----------------------------------------------------------------------------
+# ONE CANONICAL LIST, because three documents were briefly counting this
+# differently. Changing `spec.owner.team` changes exactly SIX things, and the
+# numbering below is the same numbering `systems/README.md` uses so that C-06
+# is measured against one list:
+#
+#   1. the RoleBinding subjects in the namespace — BOTH of them (`-admin` and
+#      `-crossplane-edit`; ADR-0012 §4a says "the RoleBinding subjects", and
+#      this Composition composes two bindings, not one),
+#   2. the AppProject's roles,
+#   3. the `team` label on everything composed (and its GCP-alphabet twin),
+#   4. the group's IAM member on the Artifact Registry repository,
+#   5. the project IAM member granting the group `roles/cloudsql.client`,
+#   6. the project IAM member granting the group `roles/cloudsql.instanceUser`.
+#
+# ADR-0012 §4 lists only the first four. Items 5 and 6 come from ADR-0013 §5,
+# written afterwards: humans reach their database through their own Google
+# identity, which requires the System to grant the team's group the two Cloud
+# SQL login roles. The two ADRs disagree on the count; ADR-0013 is the newer
+# decision and this Composition follows it. That belongs in the M2 build log as
+# an ADR-0012 erratum rather than staying a disagreement between documents.
+#
+# A SEVENTH CARRIER that is not in either ADR and is not a grant: the
+# `platform-system` ConfigMap's `group` key, a derived convenience copy for
+# humans and tooling. It is a plain string, so it updates in place.
+#
+# WHAT C-06 SHOULD RECORD. Files touched: one — the tenant's YAML. Resources
+# re-created: THREE — the registry IAM member and the two project IAM members,
+# because changing `member` on an IdentifierFromProvider IAM-member resource is
+# a replacement, not an update. Everything else on the list updates in place
+# (`roleRef` is the only immutable field on a RoleBinding). Predicted here,
+# before the run, so the result is a measurement rather than a surprise.
+#
+# ----------------------------------------------------------------------------
+# READINESS: the single biggest way this Composition can fail
+# ----------------------------------------------------------------------------
+# Crossplane marks an XR Ready only when EVERY composed resource is ready, and
+# `Unspecified` counts as not ready. function-auto-ready decides readiness from
+# a per-kind health check or, failing that, a `Ready=True` status condition.
+# Its registry (v0.6.9 healthchecks/registry.go, read 2026-09-16) covers
+# Namespace, ConfigMap, Secret, ServiceAccount, Pod, Service, PVC, Deployment,
+# StatefulSet, DaemonSet, ReplicaSet, Job, CronJob, HPA, Ingress — and NOTHING
+# else. ResourceQuota has no conditions. RoleBinding has no status at all.
+# AppProject's status holds only jwtTokensByRole. An Argo Application publishes
+# ComparisonError/SyncError conditions, never `Ready`.
+#
+# So four of the objects below would sit Unspecified forever and this System
+# would never go Ready. Each of them therefore carries an explicit
+# `gotemplating.fn.crossplane.io/ready: "True"` annotation, which supersedes
+# auto-ready. The GCP managed resources are left alone: they publish a real
+# Ready condition and waiting for it is exactly right.
+#
+# ----------------------------------------------------------------------------
+# WHAT THIS COMPOSITION DOES NOT DO
+# ----------------------------------------------------------------------------
+# It does not create the Google Group. Groups are a Workspace-admin task and
+# ADR-0012 §3 records that as a named manual prerequisite rather than hiding
+# it. TREAT THE GROUP AS A HARD PREREQUISITE, not as something that degrades
+# gracefully, because the two sides of this Composition behave differently and
+# only one of them is settled:
+#
+#   - Kubernetes side: SETTLED. A RoleBinding naming a Group that nobody is a
+#     member of is accepted and inert; the API server never resolves group
+#     names at write time. Nothing fails.
+#
+#   - Google Cloud side: NOT VERIFIED, and this is the one load-bearing claim
+#     in this file with no dated primary source behind it. Five resources here
+#     name `group:<team>@<orgDomain>` in an IAM binding — four ProjectIAMMembers
+#     and one RegistryRepositoryIAMMember. Searched 2026-09-16 for a Google
+#     statement on whether setIamPolicy accepts a principal email that does not
+#     resolve to a Workspace identity (cloud.google.com/iam/docs:
+#     principal-identifiers, granting-changing-revoking-access, policies,
+#     resource-manager setIamPolicy reference) and found no sentence either
+#     way. If IAM rejects the binding, those five managed resources sit
+#     not-Ready, the System XR sits Ready=False with them named in the message,
+#     and the `systems` Application stays Progressing — which would stop C-05's
+#     stopwatch for a reason nothing in the cluster explains.
+#
+# So: create the groups before the first System syncs. The first cycle settles
+# the question either way in one observation, and the answer belongs back in
+# this comment with a date on it.
+#
+# It does not grant cluster access. `roles/container.clusterViewer` is granted
+# once in layer 0 to the umbrella group `gke-security-groups@<orgDomain>`
+# (ADR-0012 §5), so a team move touches no cloud IAM for authentication.
+apiVersion: apiextensions.crossplane.io/v1
+kind: Composition
+metadata:
+  name: system
+  annotations:
+    # Sync wave 1 within the compositions Application: after the XRD (wave 0),
+    # whose CRD this Composition's compositeTypeRef names.
+    argocd.argoproj.io/sync-wave: "1"
+spec:
+  compositeTypeRef:
+    apiVersion: platform.thecloudgeek.io/v1alpha1
+    kind: System
+
+  mode: Pipeline
+  pipeline:
+
+    # ------------------------------------------------------------------------
+    # Step 1 — load the per-environment constants.
+    # ------------------------------------------------------------------------
+    # ADR-0012 §3 puts the org domain in an EnvironmentConfig so that team →
+    # group resolution has no second file. The same argument covers the project
+    # and the region. This step merges `crossplane/platform/environment.yaml`
+    # into the pipeline context under the well-known key
+    # `apiextensions.crossplane.io/environment`, where the template step reads
+    # it.
+    #
+    # `policy.resolution: Optional` on purpose. Verified 2026-09-16 against
+    # function-environment-configs v0.7.5 fn.go (processSourceByReference): a
+    # `Reference` whose EnvironmentConfig is missing returns
+    # `Required environment config %q not found` — FATAL — unless the
+    # resolution policy is Optional, in which case it is a no-op. Combined with
+    # the per-key fallbacks in the template below, that means a missing or
+    # half-populated EnvironmentConfig degrades to the reference build's
+    # constants instead of wedging every System on the cluster. The fallbacks
+    # are not duplication for its own sake: they are what keeps a config
+    # ordering problem from becoming a tenancy outage.
+    - step: environment
+      functionRef:
+        name: function-environment-configs
+      input:
+        apiVersion: environmentconfigs.fn.crossplane.io/v1beta1
+        kind: Input
+        spec:
+          policy:
+            resolution: Optional
+          environmentConfigs:
+            - type: Reference
+              ref:
+                name: platform
+
+    # ------------------------------------------------------------------------
+    # Step 2 — render every composed object.
+    # ------------------------------------------------------------------------
+    - step: render
+      functionRef:
+        name: function-go-templating
+      input:
+        apiVersion: gotemplating.fn.crossplane.io/v1beta1
+        kind: GoTemplate
+        source: Inline
+        # `options` is a TOP-LEVEL field of GoTemplate, not a child of `inline`
+        # (verified 2026-09-16 against function-go-templating v0.12.5
+        # input/v1beta1/input.go). missingkey=error makes a typo in a field
+        # path a loud failure instead of the string "<no value>" silently
+        # becoming a resource name.
+        options:
+          - missingkey=error
+        inline:
+          template: |
+            {{- /*
+              ================================================================
+              Bindings. Everything below is derived; nothing is spelled twice.
+              ================================================================
+              `dig` is used for every context/environment lookup rather than a
+              dotted path, because missingkey=error would abort the whole
+              template if the key were absent — and the environment key IS
+              absent on the pipeline iteration before the EnvironmentConfig is
+              fetched, and permanently absent if resolution came back Optional
+              and empty. `dig` returns the default in both cases.
+            */ -}}
+            {{- $xr   := .observed.composite.resource }}
+            {{- $name := $xr.metadata.name }}
+            {{- $team := $xr.spec.owner.team }}
+            {{- $repo := $xr.spec.owner.repo }}
+            {{- $sec  := $xr.spec.securityTier }}
+            {{- $size := $xr.spec.size }}
+            {{- /* `tier` has a schema default, but crossplane render does not
+                   apply CRD defaults, so read it defensively. */ -}}
+            {{- $tier := dig "tier" "standard" $xr.spec }}
+
+            {{- $env := dig "context" "apiextensions.crossplane.io/environment" (dict) . }}
+            {{- $project      := dig "projectID"    "platform-factory-ref" $env }}
+            {{- $region       := dig "region"       "us-central1" $env }}
+            {{- $domain       := dig "orgDomain"    "thecloudgeek.io" $env }}
+            {{- $gitBase      := dig "gitBase"      "https://github.com" $env }}
+            {{- $registryBase := dig "registryBase" "us-central1-docker.pkg.dev/platform-factory-ref" $env }}
+            {{- /* The Artifact Registry LOCATION is its own key, not $region.
+                   An Artifact Registry host is <location>-docker.pkg.dev, so
+                   the location is already encoded in $registryBase's hostname
+                   and is not necessarily the region the workload runs in. An
+                   environment with region us-east1 and a us-central1 registry
+                   is a normal shape; reusing $region here would create the
+                   repository in one region while telling the developer to push
+                   to another. Defaults to $region because in THIS build they
+                   are the same value. */ -}}
+            {{- $registryLocation := dig "registryLocation" $region $env }}
+
+            {{- /* The three derived identities the whole recipe turns on. */ -}}
+            {{- $group    := printf "%s@%s" $team $domain }}
+            {{- $gsa      := printf "%s@%s.iam.gserviceaccount.com" $name $project }}
+            {{- /* `spec.owner.repo` is only `org/name` (ADR-0012 §6); the host
+                   comes from the environment so a GitHub Enterprise install or
+                   a move to GitLab is a config change, not a fork. */ -}}
+            {{- $repoURL  := printf "%s/%s" $gitBase $repo }}
+            {{- $registry := printf "%s/%s" $registryBase $name }}
+
+            {{- /*
+              Quota classes. ADR-0012 §6: the schema says S/M/L and never says
+              `cpu:`, so the numbers live here — one place, changeable without
+              an API change. S is sized for a service and a sidecar or two with
+              headroom; M doubles it; L quadruples it. Requests are the real
+              ceiling (what the scheduler reserves); limits are 2x requests so
+              a bursty pod is not instantly throttled.
+            */ -}}
+            {{- $quotas := dict
+                  "S" (dict "requestsCpu" "2"  "requestsMemory" "4Gi"  "limitsCpu" "4"  "limitsMemory" "8Gi"  "pods" "20")
+                  "M" (dict "requestsCpu" "4"  "requestsMemory" "8Gi"  "limitsCpu" "8"  "limitsMemory" "16Gi" "pods" "40")
+                  "L" (dict "requestsCpu" "8"  "requestsMemory" "16Gi" "limitsCpu" "16" "limitsMemory" "32Gi" "pods" "80") }}
+            {{- $q := index $quotas $size }}
+
+            {{- /*
+              The metadata spine, on every Kubernetes object this composes.
+              `repo` is an ANNOTATION, not a label: "/" is not a legal label
+              value. These four labels are also what Kyverno's tenant-namespace
+              rule matches on (platform.thecloudgeek.io/system Exists) and what
+              ADR-0015's orphan runbook queries.
+            */ -}}
+            {{- $labels := dict
+                  "platform.thecloudgeek.io/system"        $name
+                  "platform.thecloudgeek.io/team"          $team
+                  "platform.thecloudgeek.io/tier"          $tier
+                  "platform.thecloudgeek.io/security-tier" $sec }}
+
+            {{- /*
+              The same spine on the GCP side. Google resource labels allow only
+              lowercase letters, digits, dashes and underscores in KEYS — no
+              dots, no slashes — so the prefixed Kubernetes keys cannot be
+              reused verbatim. Same facts, different alphabet.
+            */ -}}
+            {{- $gcpLabels := dict
+                  "system"        $name
+                  "team"          $team
+                  "tier"          $tier
+                  "security-tier" $sec
+                  "managed-by"    "crossplane" }}
+
+            ---
+            # ================================================================
+            # The namespace. The System's name IS the namespace name, which is
+            # why ADR-0012 makes the name immutable: a namespace name is
+            # immutable identity in Kubernetes, so renaming a System is a
+            # migration, not an edit.
+            # ================================================================
+            apiVersion: v1
+            kind: Namespace
+            metadata:
+              name: {{ $name }}
+              labels:
+                {{- $labels | toYaml | nindent 4 }}
+              annotations:
+                {{ setResourceNameAnnotation "namespace" }}
+                platform.thecloudgeek.io/repo: {{ $repo | quote }}
+            # No readiness annotation: function-auto-ready treats a Namespace as
+            # ready the moment it exists.
+
+            ---
+            # ================================================================
+            # The quota, from the size class.
+            # ================================================================
+            apiVersion: v1
+            kind: ResourceQuota
+            metadata:
+              name: {{ $name }}
+              namespace: {{ $name }}
+              labels:
+                {{- $labels | toYaml | nindent 4 }}
+              annotations:
+                {{ setResourceNameAnnotation "quota" }}
+                # ResourceQuota publishes no status conditions, so auto-ready
+                # would leave it Unspecified and this System would never go
+                # Ready. There is nothing to wait for: it is enforced the
+                # instant it exists.
+                gotemplating.fn.crossplane.io/ready: "True"
+            spec:
+              # A QUOTA ON A COMPUTE RESOURCE MAKES THAT RESOURCE MANDATORY.
+              # Because `limits.cpu` and `limits.memory` appear here, every
+              # container AND every restartable init container in this namespace
+              # must set both, or the pod is rejected at admission — the
+              # Deployment applies, Argo CD stays green, and the ReplicaSet
+              # silently creates nothing:
+              #   pods "x-..." is forbidden: failed quota: <system>:
+              #   must specify limits.cpu for: <containers>
+              # (kubernetes.io, "Resource Quotas": "For cpu and memory
+              # resources, ResourceQuotas enforce that every (new) pod in that
+              # namespace sets a limit for that resource", read 2026-09-16.)
+              # That is a deliberate contract, not a side effect: an unbounded
+              # container is how one tenant starves the node pool. The tenant
+              # cannot paper over it with a LimitRange of its own — the
+              # AppProject blocks that kind — so the obligation is documented
+              # on the tenant side too (svc-hello's k8s/deployment.yaml says
+              # the same thing next to its `resources:` blocks). If that ever
+              # proves too sharp an edge, the fix is to compose a LimitRange
+              # HERE with a default cpu/memory limit; the quota and the
+              # LimitRange are a pair.
+              hard:
+                requests.cpu: {{ $q.requestsCpu | quote }}
+                requests.memory: {{ $q.requestsMemory | quote }}
+                limits.cpu: {{ $q.limitsCpu | quote }}
+                limits.memory: {{ $q.limitsMemory | quote }}
+                pods: {{ $q.pods | quote }}
+
+            ---
+            # ================================================================
+            # RBAC, part 1 of 2: ordinary workload access.
+            #
+            # The team's Google Group gets Kubernetes' built-in `admin`
+            # ClusterRole, scoped to this namespace by a RoleBinding. GKE
+            # resolves the group only because the cluster was created with
+            # authenticator_groups_config pointing at
+            # gke-security-groups@<orgDomain> and this group is nested inside
+            # it — a Workspace-admin prerequisite, not something the platform
+            # creates.
+            #
+            # Group names in RBAC are CASE-SENSITIVE (GKE Google Groups RBAC
+            # doc, read 2026-09-16). The XRD's lowercase-only pattern on
+            # `spec.owner.team` is what keeps that from being a trap.
+            #
+            # Crossplane may create this binding only because
+            # crossplane/platform/rbac.yaml grants it `bind` on the ClusterRole
+            # `admin` by name. Kubernetes otherwise refuses to let anything
+            # hand out permissions it does not itself hold.
+            # ================================================================
+            apiVersion: rbac.authorization.k8s.io/v1
+            kind: RoleBinding
+            metadata:
+              name: {{ $name }}-admin
+              namespace: {{ $name }}
+              labels:
+                {{- $labels | toYaml | nindent 4 }}
+              annotations:
+                {{ setResourceNameAnnotation "rolebinding-admin" }}
+                # RoleBinding has no status field at all.
+                gotemplating.fn.crossplane.io/ready: "True"
+            roleRef:
+              apiGroup: rbac.authorization.k8s.io
+              kind: ClusterRole
+              name: admin
+            subjects:
+              # Team-dependent carrier 1 of 6 (ADR-0012 §4a), first of the two
+              # RoleBindings it covers. Updates in place —
+              # `roleRef` is the only immutable field on a RoleBinding — so a
+              # team move does not re-create this object.
+              - apiGroup: rbac.authorization.k8s.io
+                kind: Group
+                name: {{ $group | quote }}
+
+            ---
+            # ================================================================
+            # RBAC, part 2 of 2: the claim API — and why `admin` alone is not
+            # enough.
+            #
+            # This is the single most counter-intuitive fact in the M2 build,
+            # so it gets the long comment. Crossplane's RBAC manager aggregates
+            # managed-resource kinds and composite-resource kinds into ITS OWN
+            # ClusterRoles (`crossplane-admin`, `crossplane-edit`,
+            # `crossplane-view`) using ITS OWN label
+            # `rbac.crossplane.io/aggregate-to-edit` — NOT Kubernetes'
+            # `rbac.authorization.k8s.io/aggregate-to-edit`. Verified
+            # 2026-09-16 by grepping the vendored chart's
+            # rbac-manager-managed-clusterroles.yaml for the Kubernetes label:
+            # zero hits.
+            #
+            # Consequence: a team bound only to the built-in `admin` gets
+            # NOTHING on platform.thecloudgeek.io XRs and nothing on
+            # *.gcp.m.upbound.io managed resources — it could not create the
+            # very Database claim the paved road exists to offer. So the team
+            # is bound to `crossplane-edit` as well.
+            #
+            # `crossplane-edit` rather than `crossplane-admin`: the admin
+            # variant additionally carries rolebindings:"*" and namespaces:"*",
+            # and rolebindings inside the tenant's own namespace would let a
+            # team re-grant itself. `crossplane-edit`'s cluster-scoped rules
+            # (namespaces get/list/watch, apiextensions/pkg groups) are inert
+            # when bound through a RoleBinding; what actually lands in the
+            # namespace is secrets, the XR kinds, and the managed-resource
+            # kinds.
+            #
+            # THE MANAGED-RESOURCE KINDS ARE A LOOSE END, AND KYVERNO ONLY
+            # HALF-CLOSES IT. Be precise about this rather than comfortable:
+            #
+            #   - What the team gets. Crossplane's RBAC manager writes a
+            #     ClusterRole per ProviderRevision granting verbs `*` — get,
+            #     list, create, update, patch, DELETE — on every managed-resource
+            #     kind that provider owns, labelled
+            #     rbac.crossplane.io/aggregate-to-edit so it folds into
+            #     `crossplane-edit`. Verified 2026-09-16 against crossplane
+            #     v2.3.5 internal/controller/rbac/provider/roles/roles.go:
+            #     `verbsEdit = []string{rbacv1.VerbAll}` (line 57), applied at
+            #     line 155 to the `:aggregate-to-edit` role. Bound through the
+            #     RoleBinding below, that is `*` on every *.gcp.m.upbound.io
+            #     object IN THIS NAMESPACE — including the ones this
+            #     Composition and the Database Composition create.
+            #
+            #   - What Kyverno actually blocks. `deny-raw-managed-resources`
+            #     matches `operations: [CREATE]` only. So hand-creating a raw
+            #     DatabaseInstance is blocked; `kubectl patch` and
+            #     `kubectl delete` on a COMPOSED one are not. Crossplane
+            #     restores both on its next reconcile, so the damage is bounded
+            #     by one reconcile interval — except for the case worth naming:
+            #     patching `managementPolicies` on a durable resource (ADR-0015)
+            #     before deleting it.
+            #
+            #   - Why the rule is not simply widened to UPDATE and DELETE. The
+            #     rule's escape hatch excludes
+            #     system:serviceaccount:crossplane-system:crossplane, which is
+            #     the identity that CREATES composed resources. Provider pods
+            #     reconcile them as their own KSAs (provider-gcp-sql and the
+            #     rest), so an UPDATE-side rule with the same exclusion would
+            #     block the providers' own writes. Fixing that means listing
+            #     every provider KSA in the exclusion, which is a new thing to
+            #     keep in step with the provider list.
+            #
+            #   - The narrower design, recorded so the next person does not
+            #     have to rediscover it: stop binding `crossplane-edit` and
+            #     compose a purpose-built namespaced Role granting `*` on
+            #     platform.thecloudgeek.io [databases, databases/status] alone —
+            #     the team needs claims, never raw MRs. That is deliberately NOT
+            #     done in M2 because it needs `roles` (not just `rolebindings`)
+            #     added to crossplane/platform/rbac.yaml and `crossplane-edit`
+            #     dropped from its `bind` list, which is a second file and a
+            #     second stream. It is the right M3 change.
+            #
+            # So: two mechanisms, one boundary, and the boundary has a seam at
+            # update/delete that is documented rather than papered over.
+            # ================================================================
+            apiVersion: rbac.authorization.k8s.io/v1
+            kind: RoleBinding
+            metadata:
+              name: {{ $name }}-crossplane-edit
+              namespace: {{ $name }}
+              labels:
+                {{- $labels | toYaml | nindent 4 }}
+              annotations:
+                {{ setResourceNameAnnotation "rolebinding-crossplane-edit" }}
+                gotemplating.fn.crossplane.io/ready: "True"
+            roleRef:
+              apiGroup: rbac.authorization.k8s.io
+              kind: ClusterRole
+              name: crossplane-edit
+            subjects:
+              # Team-dependent carrier 1 of 6, second RoleBinding.
+              - apiGroup: rbac.authorization.k8s.io
+                kind: Group
+                name: {{ $group | quote }}
+
+            ---
+            # ================================================================
+            # The tenant's Argo CD project — the git-side half of the boundary.
+            #
+            # Kyverno catches `kubectl`; this catches `git`. A tenant's
+            # Application can only sync from its own repo, into its own
+            # namespace, and only kinds this project permits.
+            #
+            # TWO SCHEMA TRAPS, both verified 2026-09-16 against argo-cd v3.4.6
+            # pkg/apis/application/v1alpha1/app_project_types.go:398:
+            #   isWhiteListed = whitelist == nil || len(whitelist) != 0 && inList(...)
+            #   - namespaceResourceWhitelist ABSENT  => ALL namespaced kinds allowed.
+            #     Written as `[]` => NOTHING allowed. Never write the empty list.
+            #   - clusterResourceWhitelist  ABSENT  => NO cluster-scoped kinds allowed,
+            #     which is exactly the tenant boundary we want. Also absent on purpose.
+            # Both are omitted below, and the omissions mean opposite things.
+            # ================================================================
+            apiVersion: argoproj.io/v1alpha1
+            kind: AppProject
+            metadata:
+              name: {{ $name }}
+              namespace: argocd
+              labels:
+                {{- $labels | toYaml | nindent 4 }}
+              annotations:
+                {{ setResourceNameAnnotation "appproject" }}
+                platform.thecloudgeek.io/repo: {{ $repo | quote }}
+                # AppProject's status carries only jwtTokensByRole — no
+                # conditions, nothing to wait for.
+                gotemplating.fn.crossplane.io/ready: "True"
+            spec:
+              description: >-
+                System {{ $name }}, owned by {{ $team }}. Composed by the System XR;
+                edits here are overwritten.
+              # One repo. A System is one deployable unit and one service repo
+              # (ADR-0012 §1), so the project's source list is that repo and
+              # nothing else.
+              sourceRepos:
+                - {{ $repoURL | quote }}
+              destinations:
+                - server: https://kubernetes.default.svc
+                  namespace: {{ $name }}
+              # DELIBERATELY ABSENT: clusterResourceWhitelist (denies every
+              # cluster-scoped kind) and namespaceResourceWhitelist (absent
+              # allows all namespaced kinds; the blacklist below is what draws
+              # the line).
+              namespaceResourceBlacklist:
+                # Cloud resources come from claims, never from a tenant's own
+                # manifests. The Argo-side twin of the Kyverno rule.
+                - group: "*.upbound.io"
+                  kind: "*"
+                - group: "*.crossplane.io"
+                  kind: "*"
+                # THE ONE THAT MATTERS. Access is granted by this Composition,
+                # never self-granted. Without this, a tenant could bind its own
+                # ServiceAccount to any ClusterRole the API server would allow
+                # and walk out of its namespace.
+                - group: "rbac.authorization.k8s.io"
+                  kind: "*"
+                # Size class is a System field. A tenant raising its own quota
+                # would make `spec.size` a suggestion.
+                - group: ""
+                  kind: ResourceQuota
+                - group: ""
+                  kind: LimitRange
+                # A tenant cannot write its own policy exemptions.
+                - group: "kyverno.io"
+                  kind: "*"
+                # NOT BLOCKED, and all three are judgment calls worth
+                # defending:
+                #  - platform.thecloudgeek.io — THE PAVED ROAD'S OWN ENTRY
+                #    POINT, and the one place where blocking the group would
+                #    have been a self-inflicted wound. A tenant's k8s/ directory
+                #    is exactly where a `Database` claim belongs: six lines of
+                #    YAML in the team's own repo, which is the whole promise of
+                #    ADR-0013. Blacklisting the group would make Argo refuse it
+                #    on every sync — "resource platform.thecloudgeek.io:Database
+                #    is not permitted in project <system>" — forever, since a
+                #    deterministic denial is not something the retry backstop
+                #    can clear, and it would make the crossplane-edit
+                #    RoleBinding above (which exists solely so the team CAN
+                #    create that claim) pointless.
+                #    The kind a tenant must NOT mint — `System` itself — is
+                #    already denied by a different mechanism: System is
+                #    CLUSTER-scoped, and the deliberately-absent
+                #    clusterResourceWhitelist denies every cluster-scoped kind.
+                #    Verified 2026-09-16 against argo-cd v3.4.6
+                #    app_project_types.go:399 IsGroupKindNamePermitted: the
+                #    cluster branch computes `len(clusterWhitelist) != 0 && ...`,
+                #    which is false when the list is absent. HOW MANY claims a
+                #    namespace may hold is Kyverno's database-claim-budget, not
+                #    this list. If some future NAMESPACED kind in this group is
+                #    ever platform-only, blacklist that kind BY NAME — never the
+                #    whole group.
+                #  - ServiceAccount. The spike's sample blocked it. We do not:
+                #    third-party Helm charts create service accounts constantly,
+                #    and blocking them turns the paved road into a dead end with
+                #    no self-service way round. A tenant-created ServiceAccount
+                #    is harmless precisely BECAUSE rbac.authorization.k8s.io is
+                #    blocked above — it can be bound to nothing — and a Workload
+                #    Identity annotation on it grants nothing without a matching
+                #    binding on the Google service account, which only this
+                #    Composition creates.
+                #  - NetworkPolicy. A tenant tightening traffic into its own
+                #    namespace can only ever reduce its own reachability. Taking
+                #    that away would block a team from improving its own posture
+                #    and buy nothing.
+              roles:
+                # PLACEHOLDER UNTIL SSO, and the comment matters more than the
+                # block. Argo CD groups come from ARGO CD's own OIDC/Dex groups
+                # claim — not from GKE's Google Groups integration, which is a
+                # Kubernetes API-server concern. argocd-server has no SSO
+                # configured in M2, so no session carries a groups claim and
+                # this role grants nobody anything today. Verified 2026-09-16:
+                # app_project_types.go:385 ProjectPoliciesString emits
+                # "g, <group>, proj:<project>:<role>" into Casbin, which
+                # matches no subject. The enforceable tenant boundary in M2 is
+                # the Kubernetes RoleBinding above plus Kyverno; this starts
+                # working the day Dex is wired to Google Workspace.
+                - name: developer
+                  description: >-
+                    {{ $group }} — view and sync {{ $name }} (inert until Argo CD SSO).
+                  # Team-dependent carrier 2 of 6 (ADR-0012 §4b).
+                  groups:
+                    - {{ $group | quote }}
+                  # The subject MUST be spelled proj:<project>:<role> or Argo
+                  # ignores the line entirely.
+                  policies:
+                    - p, proj:{{ $name }}:developer, applications, get, {{ $name }}/*, allow
+                    - p, proj:{{ $name }}:developer, applications, sync, {{ $name }}/*, allow
+                    - p, proj:{{ $name }}:developer, logs, get, {{ $name }}/*, allow
+
+            ---
+            # ================================================================
+            # The tenant's Argo CD Application: the service repo's k8s/
+            # directory, synced into the tenant namespace under the project
+            # above.
+            #
+            # No sync-wave annotation. Waves order objects Argo CD applies from
+            # a directory; this object is created by Crossplane directly and
+            # Argo CD only ever reconciles what it points at. The retry block
+            # keeps this repo's convention: a backstop for transient failure,
+            # never the ordering mechanism.
+            #
+            # No CreateNamespace=true. The namespace is composed above, by this
+            # same recipe; letting Argo CD also claim it would put two
+            # controllers on one object.
+            # ================================================================
+            apiVersion: argoproj.io/v1alpha1
+            kind: Application
+            metadata:
+              name: {{ $name }}
+              namespace: argocd
+              labels:
+                {{- $labels | toYaml | nindent 4 }}
+              annotations:
+                {{ setResourceNameAnnotation "application" }}
+                platform.thecloudgeek.io/repo: {{ $repo | quote }}
+                # READY ON EXISTENCE, and this is a real decision with a real
+                # alternative. An Argo Application never publishes a `Ready`
+                # condition, so something must be said here or the System hangs
+                # forever. The alternative — gate on Argo's own
+                # status.health.status == "Healthy" — sounds better and is
+                # worse: a service repo whose k8s/ directory does not exist yet
+                # leaves the Application at sync status Unknown with a
+                # ComparisonError, permanently, and C-05 onboards a SECOND
+                # tenant whose repo may well be empty on day one. That would
+                # make a platform object's readiness depend on a tenant's git
+                # history and would deadlock the exact test this is built for.
+                #
+                # The honest statement is the one encoded here: the platform's
+                # job is to create the Application. Whether the tenant's repo
+                # syncs is the tenant's signal, and it is already visible — on
+                # this Application, in Argo CD's own UI.
+                gotemplating.fn.crossplane.io/ready: "True"
+            spec:
+              project: {{ $name }}
+              source:
+                repoURL: {{ $repoURL | quote }}
+                targetRevision: main
+                path: k8s
+              destination:
+                server: https://kubernetes.default.svc
+                namespace: {{ $name }}
+              syncPolicy:
+                automated:
+                  prune: true
+                  selfHeal: true
+                syncOptions:
+                  - ServerSideApply=true
+                retry:
+                  limit: 10
+                  backoff:
+                    duration: 15s
+                    factor: 2
+                    maxDuration: 5m
+
+            ---
+            # ================================================================
+            # The System's Kubernetes identity. A pod sets
+            # `serviceAccountName: {{ $name }}` and is, to Google, the System's
+            # service account — no key, no secret, nothing in git.
+            #
+            # BOTH HALVES ARE REQUIRED (Google's Workload Identity how-to): the
+            # annotation here, and the roles/iam.workloadIdentityUser binding
+            # below. Either alone is silent failure.
+            #
+            # THIS IS THE SERVICE ACCOUNT A TENANT'S DEPLOYMENT SHOULD NAME.
+            # The AppProject above does not blacklist ServiceAccount, so a team
+            # CAN ship one of its own (a third-party Helm chart routinely does)
+            # — but one of its own carries no cloud identity, because the
+            # Workload Identity binding below names THIS name and nothing else.
+            # A workload that wants to reach the System's database or its
+            # registry sets `serviceAccountName: {{ $name }}`.
+            # ================================================================
+            apiVersion: v1
+            kind: ServiceAccount
+            metadata:
+              name: {{ $name }}
+              namespace: {{ $name }}
+              labels:
+                {{- $labels | toYaml | nindent 4 }}
+              annotations:
+                {{ setResourceNameAnnotation "serviceaccount" }}
+                iam.gke.io/gcp-service-account: {{ $gsa | quote }}
+
+            ---
+            # ================================================================
+            # The System's Google identity (ADR-0013 §1).
+            #
+            # Namespaced managed resource (*.gcp.m.upbound.io), placed in the
+            # tenant's namespace, for two reasons: one MR family across both
+            # Compositions, and it puts every cloud object a tenant owns inside
+            # the blast radius Kyverno's namespace-label rule covers.
+            #
+            # `spec.providerConfigRef` is deliberately omitted. Verified
+            # 2026-09-16 against provider-upjet-gcp v3.0.0's CRDs: it DEFAULTS
+            # to {kind: ClusterProviderConfig, name: default}, which is exactly
+            # the one cluster-scoped object crossplane/platform/provider-config.yaml
+            # creates. One object serves every namespace; there is no
+            # per-tenant ProviderConfig to compose.
+            #
+            # The external-name annotation is REQUIRED, not decorative. For
+            # kinds whose GCP identifier is templated from a name field, upjet
+            # runs a name initializer that copies `metadata.name` into
+            # `crossplane.io/external-name` when the annotation is absent — and
+            # Crossplane generates `metadata.name` for composed resources. Left
+            # implicit, this account would be created as
+            # `{{ $name }}-gsa@...`, not `{{ $name }}@...`, and ADR-0013's
+            # whole naming convention would quietly break. There is no
+            # `accountId` field on this kind; the annotation is the only way to
+            # set it.
+            # ================================================================
+            apiVersion: cloudplatform.gcp.m.upbound.io/v1beta1
+            kind: ServiceAccount
+            metadata:
+              name: {{ $name }}-gsa
+              namespace: {{ $name }}
+              labels:
+                {{- $labels | toYaml | nindent 4 }}
+              annotations:
+                {{ setResourceNameAnnotation "gsa" }}
+                crossplane.io/external-name: {{ $name }}
+            spec:
+              forProvider:
+                project: {{ $project }}
+                displayName: {{ printf "System %s" $name | quote }}
+                description: >-
+                  Workload identity for System {{ $name }} (team {{ $team }}).
+                  Composed by the System XR; do not edit by hand.
+
+            ---
+            # ================================================================
+            # Workload Identity: the Kubernetes service account above may
+            # impersonate the Google one.
+            #
+            # No external-name annotation here, and that is the opposite rule
+            # from the resource above. This kind is configured
+            # `IdentifierFromProvider` in provider-upjet-gcp v3.0.0
+            # (config/externalname.go:106), which sets DisableNameInitializer
+            # and uses the external-name verbatim as the Terraform ID. Setting
+            # it would hand the provider a malformed ID. The same applies to
+            # every *IAMMember kind below.
+            #
+            # `serviceAccountId` is written as a literal rather than a
+            # `serviceAccountIdRef` to the resource above. A ref would work,
+            # but it makes this object's reconcile depend on the other one's
+            # Kubernetes name resolving first, for no gain: the literal is
+            # fully determined by the System's name, which is immutable.
+            # ================================================================
+            apiVersion: cloudplatform.gcp.m.upbound.io/v1beta1
+            kind: ServiceAccountIAMMember
+            metadata:
+              name: {{ $name }}-workload-identity
+              namespace: {{ $name }}
+              labels:
+                {{- $labels | toYaml | nindent 4 }}
+              annotations:
+                {{ setResourceNameAnnotation "gsa-workload-identity" }}
+            spec:
+              forProvider:
+                serviceAccountId: projects/{{ $project }}/serviceAccounts/{{ $gsa }}
+                role: roles/iam.workloadIdentityUser
+                # The workload identity pool is always <PROJECT_ID>.svc.id.goog
+                # — the project ID, never the project number. Layer 2 sets the
+                # cluster's workload_pool to exactly this.
+                member: serviceAccount:{{ $project }}.svc.id.goog[{{ $name }}/{{ $name }}]
+
+            {{- /*
+              ================================================================
+              Cloud SQL access grants (ADR-0013 §1 and §5).
+
+              Four ProjectIAMMembers: two roles x two principals.
+                - roles/cloudsql.client       — connect through the Auth Proxy
+                                                or a language connector.
+                - roles/cloudsql.instanceUser — log in as an IAM database user.
+              Principals: the System's Google service account (how the APP
+              connects) and the owning team's group (how a HUMAN connects, from
+              the tailnet, as themselves — ADR-0013 §5: there is no shared
+              database password for anyone to paste into a chat).
+
+              Both roles are documented as grantable no lower than the PROJECT
+              (cloud.google.com/iam/docs/roles-permissions/cloudsql). Project
+              scope here is not laziness; it is the only option. The grant is
+              harmless without a database: an identity with no user row on any
+              instance can log in nowhere (ADR-0013 §1).
+
+              Crossplane's provider identity can make these grants only because
+              layer 0 gives it roles/resourcemanager.projectIamAdmin under an
+              IAM Condition restricting it to these two role names exactly.
+
+              Rendered from a loop so the four objects cannot drift apart. Go
+              templates iterate maps in sorted key order, so the output is
+              deterministic.
+              ================================================================
+            */ -}}
+            {{- $sqlRoles := dict "sql-client" "roles/cloudsql.client" "sql-instance-user" "roles/cloudsql.instanceUser" }}
+            {{- $sqlPrincipals := dict "app" (printf "serviceAccount:%s" $gsa) "team" (printf "group:%s" $group) }}
+            {{- range $roleSuffix, $role := $sqlRoles }}
+            {{- range $who, $member := $sqlPrincipals }}
+            ---
+            apiVersion: cloudplatform.gcp.m.upbound.io/v1beta1
+            kind: ProjectIAMMember
+            metadata:
+              name: {{ $name }}-{{ $roleSuffix }}-{{ $who }}
+              namespace: {{ $name }}
+              labels:
+                {{- $labels | toYaml | nindent 4 }}
+              annotations:
+                {{ setResourceNameAnnotation (printf "iam-%s-%s" $roleSuffix $who) }}
+            spec:
+              forProvider:
+                project: {{ $project }}
+                role: {{ $role }}
+                # Team-dependent carriers 5 and 6 of 6 when $who is "team"
+                # (ADR-0013 §5) — and two of the three entries in C-06's
+                # "re-created" column: changing `member` replaces an
+                # IdentifierFromProvider IAM-member resource rather than
+                # updating it.
+                member: {{ $member | quote }}
+            {{- end }}
+            {{- end }}
+
+            ---
+            # ================================================================
+            # The System's container registry (ADR-0010 image plane, ADR-0012 §1).
+            #
+            # DURABLE (ADR-0015 §1). `managementPolicies` omits Delete, so
+            # deleting the System leaves the repository and its images
+            # standing. There is no `deletionPolicy: Orphan` to reach for here:
+            # verified 2026-09-16 against provider-upjet-gcp v3.0.0's namespaced
+            # CRDs, `spec` has exactly five properties — forProvider,
+            # initProvider, managementPolicies, providerConfigRef,
+            # writeConnectionSecretToRef — and deletionPolicy is NOT among
+            # them. It exists only on the cluster-scoped twin. Durability on a
+            # namespaced MR is expressible only as managementPolicies.
+            #
+            # The external-name is what makes ADR-0015's rebuild-adopts rule
+            # work: on `cycle.sh up` the provider observes a repository already
+            # named {{ $name }} and adopts it instead of creating a second one.
+            # There is no `repositoryId` field on this kind — the annotation is
+            # the only way to set the GCP-side name.
+            #
+            # Offboarding a tenant therefore leaves this behind ON PURPOSE.
+            # ADR-0015 §5 makes deletion a deliberate human act with a runbook;
+            # the `system` label below is the query that runbook works from.
+            # ================================================================
+            apiVersion: artifact.gcp.m.upbound.io/v1beta1
+            kind: RegistryRepository
+            metadata:
+              name: {{ $name }}-registry
+              namespace: {{ $name }}
+              labels:
+                {{- $labels | toYaml | nindent 4 }}
+              annotations:
+                {{ setResourceNameAnnotation "registry" }}
+                crossplane.io/external-name: {{ $name }}
+            spec:
+              managementPolicies:
+                - Observe
+                - Create
+                - Update
+                - LateInitialize
+              forProvider:
+                project: {{ $project }}
+                # There is no provider-level region: the ClusterProviderConfig
+                # schema has no `region` field at all, so location is literal on
+                # every resource. $registryLocation, not $region — see the
+                # binding at the top: this has to agree with the hostname in
+                # $registryBase, which is what `status.registry` and the
+                # ConfigMap tell a developer to push to.
+                location: {{ $registryLocation }}
+                format: DOCKER
+                description: {{ printf "Images for System %s (team %s)" $name $team | quote }}
+                labels:
+                  {{- $gcpLabels | toYaml | nindent 6 }}
+
+            ---
+            # ================================================================
+            # The team may push to its own registry.
+            # Team-dependent carrier 4 of 6 (ADR-0012 §4d), and the one the ADR
+            # already predicted would be re-created on a team move.
+            #
+            # `roles/artifactregistry.writer`, not admin: push and pull, not
+            # repository or IAM management. Nothing here grants the CLUSTER
+            # pull access — nodes read through the remotes and the per-System
+            # repository using the node pool's own identity.
+            #
+            # No external-name annotation (IdentifierFromProvider, as above).
+            # `repository` takes the bare repository id, not a full path, and
+            # this kind has no ...Ref/...Selector variant in v3.0.0, so the
+            # literal is the only form available.
+            # ================================================================
+            apiVersion: artifact.gcp.m.upbound.io/v1beta1
+            kind: RegistryRepositoryIAMMember
+            metadata:
+              name: {{ $name }}-registry-writer
+              namespace: {{ $name }}
+              labels:
+                {{- $labels | toYaml | nindent 4 }}
+              annotations:
+                {{ setResourceNameAnnotation "registry-writer" }}
+            spec:
+              forProvider:
+                project: {{ $project }}
+                # Must be the repository's own location, not the workload
+                # region — same reason as the repository above.
+                location: {{ $registryLocation }}
+                repository: {{ $name }}
+                role: roles/artifactregistry.writer
+                member: group:{{ $group }}
+
+            ---
+            # ================================================================
+            # The tenant's own copy of the facts, for humans and for tooling.
+            #
+            # Everything here is derivable from the System XR, but the XR is
+            # cluster-scoped and a developer working in their namespace may not
+            # be able to read it — `crossplane-edit`'s cluster-scoped rules are
+            # inert through a RoleBinding. `kubectl get cm platform-system -o
+            # yaml` answers "what is my registry path / which Google identity
+            # am I / which group owns this" without a platform engineer in the
+            # loop, which is the entire point of a paved road.
+            #
+            # A fixed name (`platform-system`, not `<system>-something`) so a
+            # script, a Helm chart or a CI job can reference it without knowing
+            # which namespace it is in.
+            # ================================================================
+            apiVersion: v1
+            kind: ConfigMap
+            metadata:
+              name: platform-system
+              namespace: {{ $name }}
+              labels:
+                {{- $labels | toYaml | nindent 4 }}
+              annotations:
+                {{ setResourceNameAnnotation "platform-system-configmap" }}
+                platform.thecloudgeek.io/repo: {{ $repo | quote }}
+            data:
+              system: {{ $name | quote }}
+              team: {{ $team | quote }}
+              # The seventh carrier, and the only one neither ADR lists: a
+              # derived convenience copy, not a grant. A plain string, so it
+              # updates in place on a team move.
+              group: {{ $group | quote }}
+              gsaEmail: {{ $gsa | quote }}
+              registry: {{ $registry | quote }}
+              repo: {{ $repo | quote }}
+              tier: {{ $tier | quote }}
+              securityTier: {{ $sec | quote }}
+              size: {{ $size | quote }}
+              project: {{ $project | quote }}
+              region: {{ $region | quote }}
+
+            ---
+            # ================================================================
+            # The XR's status. A document with the XR's own apiVersion and kind
+            # and NO composition-resource-name annotation is merged into the
+            # desired composite's status rather than composed as a resource.
+            # Adding the annotation here would compose a nested System — an
+            # infinite recursion, not a status update.
+            # ================================================================
+            apiVersion: platform.thecloudgeek.io/v1alpha1
+            kind: System
+            status:
+              namespace: {{ $name | quote }}
+              appProject: {{ $name | quote }}
+              registry: {{ $registry | quote }}
+              gsaEmail: {{ $gsa | quote }}
+
+    # ------------------------------------------------------------------------
+    # Step 3 — readiness.
+    # ------------------------------------------------------------------------
+    # Last in the pipeline, because it can only act on resources the earlier
+    # steps put into desired state. Every pass begins by skipping any resource
+    # whose readiness was already set explicitly, so the `ready: "True"`
+    # annotations above always win and the GCP managed resources are judged on
+    # their real Ready condition.
+    - step: ready
+      functionRef:
+        name: function-auto-ready

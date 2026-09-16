@@ -1,0 +1,98 @@
+# A per-System budget: at most two Database claims in one tenant namespace
+# (ADR-0014 §3, "a per-System budget: at most N Database claims in one
+# namespace").
+#
+# WHY KYVERNO AND NOT THE SCHEMA. ADR-0014's first principle is that the build
+# should be suspicious of any constraint it reaches for Kyverno to express
+# before checking whether the schema could. This one genuinely cannot live in
+# the schema: an OpenAPI schema or a CEL rule judges ONE object against itself,
+# and "how many of these already exist next door" is a question about the other
+# objects in the namespace. That is the shape of thing Kyverno exists for.
+#
+# WHY A BUDGET AT ALL. A Cloud SQL instance is the most expensive thing the
+# paved road can create by merging a five-line file, and ADR-0015 makes it
+# durable on purpose — deleting the claim does not delete the instance. Two is
+# a number chosen to be obviously raisable, not a scarcity policy: the point is
+# that the third one is a conversation, not an accident.
+#
+# On the choice of `kyverno.io/v1 ClusterPolicy` over the `policies.kyverno.io`
+# successor types that chart 3.9.1 also installs — the group is deprecated
+# upstream and the reasoning is recorded once, in the header of
+# deny-raw-managed-resources.yaml. The extra constraint here is this rule's
+# `apiCall` context: a ValidatingPolicy's whole spec is `matchConstraints`,
+# `matchConditions`, `variables`, `validations`, `auditAnnotations`,
+# `validationActions`, `evaluation`, `failurePolicy` and `webhookConfiguration`
+# (enumerated from the vendored policies.kyverno.io_validatingpolicies.yaml CRD,
+# 2026-09-16) — no `context`, and `variables` are CEL expressions over the
+# admission request, with no way to list what else is in the namespace.
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: database-claim-budget
+  annotations:
+    policies.kyverno.io/title: A system gets at most two databases
+    policies.kyverno.io/category: Platform Factory
+    policies.kyverno.io/severity: medium
+    policies.kyverno.io/subject: Database
+    policies.kyverno.io/description: >-
+      Counts the Database claims already in the namespace and denies the third.
+      A Cloud SQL instance is durable by design (ADR-0015), so an accidental
+      one outlives the pull request that made it.
+spec:
+  # The count comes from {{request.namespace}}, which exists only on an
+  # admission request; a background scan would have nothing to evaluate.
+  background: false
+  webhookConfiguration:
+    # Ignore, NOT Fail — and the contrast with deny-raw-managed-resources is
+    # the decision, not an oversight. ADR-0014 §3 says failurePolicy is Fail
+    # "for the reality gate ... so Kyverno being down blocks managed-resource
+    # creation and nothing else." A budget is a cost guardrail, not a security
+    # boundary: if Kyverno is unreachable, admitting a third database is a much
+    # smaller problem than wedging every tenant's deploys behind a policy
+    # engine outage.
+    failurePolicy: Ignore
+  rules:
+    - name: at-most-two-databases-per-namespace
+      match:
+        any:
+          - resources:
+              # Crossplane generates this CRD from the Database XRD, which
+              # lands in the SAME sync wave as this policy. Kyverno needs the
+              # CRD in API discovery before it will register a webhook rule for
+              # it — which is why apps/kyverno.yaml turns on global.crdWatcher,
+              # so discovery is invalidated the moment the CRD appears instead
+              # of at the next 15-minute resync.
+              kinds:
+                - platform.thecloudgeek.io/v1alpha1/Database
+              operations:
+                - CREATE
+      context:
+        - name: databasecount
+          apiCall:
+            # "items | length(@)" is the documented counting idiom — it is the
+            # example in the CRD's own description of this field (read from the
+            # vendored kyverno.io_clusterpolicies.yaml, 2026-09-16).
+            #
+            # This counts what ALREADY exists: the incoming claim is not stored
+            # yet, so it is not in the list, and >= 2 is what denies the third.
+            urlPath: "/apis/platform.thecloudgeek.io/v1alpha1/namespaces/{{request.namespace}}/databases"
+            jmesPath: "items | length(@)"
+            # Without a default, an RBAC or API error makes the whole rule
+            # error out. Defaulting the COUNT to 0 fails open on the count only
+            # — the rule still runs and still evaluates — which is the same
+            # judgement as failurePolicy: Ignore above.
+            default: 0
+      validate:
+        failureAction: Enforce
+        message: >-
+          This system already has {{ databasecount }} Database claims, and the
+          limit is two. A Cloud SQL instance outlives the claim that created it
+          (the platform keeps the data when the claim goes away), so a third one
+          is a decision rather than a default. Delete a Database you no longer
+          use, or open a platform request if this system genuinely needs more.
+        deny:
+          conditions:
+            all:
+              - key: "{{ databasecount }}"
+                operator: GreaterThanOrEquals
+                value: 2

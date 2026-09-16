@@ -1,0 +1,35 @@
+# RBAC for database-claim-budget.yaml. Without this the policy is inert.
+#
+# Kyverno's controllers ship with permissions for the kinds Kyverno knows
+# about; `platform.thecloudgeek.io` is ours, so the admission controller has no
+# right to LIST Database claims and the policy's `apiCall` would fail on every
+# admission. It would fail QUIETLY, too: the apiCall carries `default: 0`, so
+# the rule would evaluate a count of zero and admit every claim forever. A
+# missing grant here looks exactly like a working budget until someone creates
+# a third database. That is the reason this file sits next to the policy rather
+# than in a general RBAC directory.
+#
+# The mechanism: Kyverno's own ClusterRoles are aggregation roots, so extra
+# permissions are added by labelling a new ClusterRole rather than by editing
+# the vendored chart. Labels verified 2026-09-16 against chart 3.9.1's
+# templates/{admission,background,cleanup,reports}-controller/clusterrole.yaml.
+#
+# Three controllers, not one: the admission controller evaluates the rule at
+# admission, the reports controller needs the same read to produce the
+# PolicyReport a developer looks at afterwards, and the background controller
+# is labelled for symmetry — both M2 policies are `background: false`, so it
+# never actually uses this today.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kyverno:view-platform-claims
+  labels:
+    rbac.kyverno.io/aggregate-to-admission-controller: "true"
+    rbac.kyverno.io/aggregate-to-background-controller: "true"
+    rbac.kyverno.io/aggregate-to-reports-controller: "true"
+rules:
+  # Read-only, and only the two platform kinds. Kyverno is validate-only here
+  # (ADR-0014 §3) and never needs to write either of them.
+  - apiGroups: ["platform.thecloudgeek.io"]
+    resources: ["databases", "systems"]
+    verbs: ["get", "list", "watch"]

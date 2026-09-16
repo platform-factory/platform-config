@@ -1,0 +1,86 @@
+# The platform's APIs — XRDs and Compositions — sync wave 3 of the root
+# app-of-apps.
+#
+# WAVE 3, and every earlier wave is a hard prerequisite rather than a
+# preference:
+#   wave 0  crossplane            — the apiextensions.crossplane.io CRDs an
+#                                   XRD and a Composition ARE.
+#   wave 1  crossplane-providers  — the *.gcp.m.upbound.io CRDs the
+#                                   Compositions compose. Crossplane validates
+#                                   a Composition's rendered resources against
+#                                   real CRDs; without the providers installed
+#                                   a System XR fails at apply, not at parse.
+#   wave 2  crossplane-platform   — the Functions this pipeline calls, the
+#                                   ClusterProviderConfig the managed resources
+#                                   default to, the EnvironmentConfig the
+#                                   pipeline reads, and the aggregated
+#                                   ClusterRole without which every composed
+#                                   Namespace/RoleBinding/AppProject apply
+#                                   comes back Forbidden.
+#   wave 2  kyverno               — so the admission policies are live before
+#                                   the first tenant namespace exists.
+# The retry block is the backstop if any of that ordering regresses, exactly
+# as in apps/crossplane-providers.yaml: the sync fails on a missing CRD and is
+# retried until it arrives, rather than the root sitting Degraded.
+#
+# ONE APPLICATION FOR ALL COMPOSITIONS, not one per API. An XRD and its
+# Composition are a single unit — a Composition naming a compositeTypeRef with
+# no XRD is inert, and an XRD with no Composition admits resources it cannot
+# build — so splitting them across Applications would only invent an ordering
+# problem. Within this Application, sync waves order the pair: XRD at wave 0,
+# Composition at wave 1. A new API is a new subdirectory here and no change to
+# this file.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: compositions
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "3"
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/platform-factory/platform-config
+    targetRevision: main
+    path: crossplane/compositions
+    directory:
+      # Each API gets its own subdirectory (system/, database/), so the sync
+      # has to descend. Without this, Argo CD reads only the files directly
+      # under crossplane/compositions/ and this Application syncs nothing at
+      # all — silently, and reporting Healthy.
+      recurse: true
+      # Example XRs live next to the API they demonstrate so that
+      # `crossplane render` works in place. They must never be APPLIED: the
+      # System example is svc-hello, which the `systems` repo also declares,
+      # and two Applications owning one cluster-scoped XR is a fight neither
+      # wins.
+      #
+      # Verified 2026-09-16 against argo-cd v3.4.6: repository.go:2104 calls
+      # glob.Match(exclude, relPath) where relPath is relative to `path` above
+      # (so `system/example.yaml`), and util/glob/glob.go compiles the pattern
+      # with NO separator runes — meaning `*` crosses `/`. Hence two branches:
+      # one for an example at the root of crossplane/compositions/, one for an
+      # example at any depth below it. An example added under a new API's
+      # directory is covered with no change here.
+      exclude: '{example.yaml,*/example.yaml}'
+  destination:
+    server: https://kubernetes.default.svc
+    # XRDs and Compositions are cluster-scoped; Argo CD still requires a
+    # destination namespace, and this one exists by wave 0.
+    namespace: crossplane-system
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      # An XRD's schema is a full OpenAPI document and Crossplane generates a
+      # CRD from it. Same reason the crossplane Application sets this: client
+      # side apply stores the whole manifest in an annotation the API server
+      # caps at 262144 bytes.
+      - ServerSideApply=true
+    retry:
+      limit: 10
+      backoff:
+        duration: 15s
+        factor: 2
+        maxDuration: 5m

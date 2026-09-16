@@ -1,0 +1,794 @@
+# How a Database claim becomes a real Postgres the application can log into
+# without holding a password.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# READ THIS FIRST: the human-access half of ADR-0013 §5 is NOT built in M2.
+#
+# ADR-0013 §5 says a developer reaches their own database with `psql` from the
+# tailnet using a login token from their own Google account, via a Cloud SQL
+# user of `type: CLOUD_IAM_GROUP` named for the owning team's group. That user
+# is deliberately absent from this Composition, because this XR cannot learn
+# the team's name cheaply and correctly:
+#
+#   - ADR-0012 puts the team on the *System*, and a System is a cluster-scoped
+#     XR. A Namespaced XR like this one may not compose cluster-scoped objects
+#     and has no reference to the System that owns its namespace.
+#   - The namespace object DOES carry `platform.thecloudgeek.io/team` (the
+#     System Composition labels it), and a Composition CAN read a resource it
+#     did not compose — `function-go-templating`'s `ExtraResources` mechanism
+#     is parameterisable by the XR, and Crossplane's required-resource fetcher
+#     applies no scope restriction (crossplane v2.3
+#     internal/xfn/required_resources.go, read 2026-09-16). So the lookup is
+#     possible; it is roughly eight lines plus one RBAC rule
+#     (`namespaces: get,list,watch` on Crossplane's aggregated ClusterRole).
+#   - It is left out anyway, to keep the first Database claim's blast radius to
+#     resources this XR fully owns, and because the group must exist in the
+#     Workspace before a CLOUD_IAM_GROUP user can be created at all — which is
+#     a manual prerequisite in M2 (ADR-0012 §3).
+#
+# So in M2 a human reaches this database with the break-glass superuser
+# password in the `<claim>-admin` Secret, which their namespace RBAC lets them
+# read. That is a shared credential, which is exactly what ADR-0013 set out to
+# avoid, so it is a stated deferral and not a design: **deferred within M2 —
+# the cross-XR team lookup exists and was not built.** Do not record the
+# reason as "needs a lookup Crossplane cannot do"; it can.
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# ADMIN PASSWORD AND THE REBUILD: a known, bounded gap. Read before changing
+# the Job.
+#
+# The `<claim>-admin` Secret lives in the cluster, and the cluster is
+# disposable (C-02). After `cycle.sh down` / `up` the Secret is gone and this
+# Composition mints a NEW random password — but Cloud SQL never learns it, so
+# from cycle 2 on the Secret and the real `postgres` password disagree.
+#
+# Why the new password does not reach Cloud SQL, verified 2026-09-16 by
+# reading the code rather than inferring it:
+#   - provider-upjet-gcp v3.0.0 apis/namespaced/sql/v1beta1/
+#     zz_databaseinstance_terraformed.go: GetConnectionDetailsMapping maps
+#     "root_password" -> "rootPasswordSecretRef".
+#   - upjet v2 pkg/controller/external_tfpluginsdk.go: Connect() reconstructs
+#     the Terraform state from status.atProvider and then calls
+#     resource.GetSensitiveParameters(..., tfState, GetConnectionDetailsMapping())
+#     — writing the Secret's CURRENT value into the STATE, having already
+#     written the same value into the CONFIG.
+#   - terraform-provider-google v7.46.1 resource_sql_database_instance.go:2713
+#     only calls Users.Update for the `postgres` role
+#     `if d.HasChange("root_password")`, and Read never d.Set()s it.
+# State and config therefore always carry the same value, the diff is always
+# empty, and the root password is pushed exactly once — at instance create.
+#
+# What this Composition does about it: the GRANT Job asks the APPLICATION'S
+# identity first (an IAM login, which needs no password and survives the
+# rebuild) and only spends the admin password when the grant is genuinely
+# missing. Grants live in Postgres, which is durable, so on a rebuilt cluster
+# step 1 answers yes and the stale password is never used. C-02's zero-
+# intervention bar holds.
+#
+# What is still broken, and it is the break-glass path itself: the password a
+# developer reads out of `<claim>-admin` after a rebuild is wrong. Recovery is
+# one command — `gcloud sql users set-password postgres --instance=<instance>`
+# with the Secret's value — and it is a human step, which ADR-0013 §5 already
+# says is where human database access stands in M2.
+#
+# The real fix is cross-repo and belongs in platform-bootstrap: have layer 3
+# hold a `random_password` (its Terraform state is in GCS and outlives the
+# cluster) and write it to a Secret in `crossplane-system`, then derive each
+# claim's password from it deterministically. Then the Secret's value is the
+# same on every cycle and matches what was sent at create. Raised with the
+# platform-bootstrap stream; not built here because this Composition cannot
+# create anything outside the cluster it runs in.
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# WHAT GETS CREATED, and why each piece is here:
+#
+#   instance      sql DatabaseInstance   private-IP-only Postgres, IAM auth on
+#   database      sql Database "app"     the database the app actually uses
+#   iam-user      sql User               the app's identity as a Postgres role
+#   admin-secret  core/v1 Secret         superuser password, break-glass only
+#   grant-<hash>  batch/v1 Job           runs the GRANT the IAM user needs
+#   connection    core/v1 ConfigMap      what the app's Deployment reads
+#
+# The Job is the part that looks like machinery and is not optional. Cloud SQL
+# creates an IAM database user with no privileges on anything; only a
+# privileged Postgres role can grant them, and on a fresh Cloud SQL Postgres
+# instance the only privileged role is the built-in `postgres` user with a
+# password (ADR-0013 context). That is the entire reason a password exists in
+# this design at all — and the reason nothing mounts it but this Job.
+#
+# PREREQUISITE OUTSIDE THIS REPO. A private-IP DatabaseInstance needs Private
+# Services Access — an allocated range and a service-networking peering on the
+# VPC — from platform-bootstrap `layers/1-network`. If that apply has not
+# happened, this Composition renders fine and the DatabaseInstance sits in a
+# NETWORK_NOT_PEERED error loop rather than failing loudly. Check there first
+# when an instance never gets an IP.
+apiVersion: apiextensions.crossplane.io/v1
+kind: Composition
+metadata:
+  name: database
+  annotations:
+    # Wave 1 inside apps/compositions.yaml: after xrd.yaml at wave 0, because
+    # compositeTypeRef below names a kind that does not exist until Crossplane
+    # has turned that XRD into a CRD.
+    argocd.argoproj.io/sync-wave: "1"
+spec:
+  compositeTypeRef:
+    apiVersion: platform.thecloudgeek.io/v1alpha1
+    kind: Database
+  mode: Pipeline
+  pipeline:
+    # 1. Pull the per-environment constants into the pipeline context.
+    #    Resolution is Required (the default): the EnvironmentConfig ships in
+    #    this repo at sync wave 2 and compositions at wave 3, so a missing one
+    #    is a broken platform, not a condition to paper over.
+    #
+    #    THE SYSTEM COMPOSITION MAKES THE OPPOSITE CALL, and the asymmetry is
+    #    known rather than accidental. It sets `policy.resolution: Optional`
+    #    and gives every key a hardcoded fallback, so a missing or
+    #    half-populated EnvironmentConfig degrades to this build's constants
+    #    instead of wedging tenancy — the argument being that losing the
+    #    ability to create namespaces is worse than creating them with the
+    #    reference values. Here the same failure would mint a Cloud SQL
+    #    instance in the wrong project or on the wrong VPC, which is not
+    #    recoverable by fixing a ConfigMap afterwards. So: cheap and reversible
+    #    degrades, expensive and durable stops. If this platform is ever stood
+    #    up a second time with different constants, the System Composition's
+    #    fallbacks are the thing to re-read first — they will silently keep
+    #    working while pointing at platform-factory-ref.
+    - step: environment
+      functionRef:
+        name: function-environment-configs
+      input:
+        apiVersion: environmentconfigs.fn.crossplane.io/v1beta1
+        kind: Input
+        spec:
+          environmentConfigs:
+            - type: Reference
+              ref:
+                name: platform
+
+    # 2. Render everything.
+    - step: render
+      functionRef:
+        name: function-go-templating
+      input:
+        apiVersion: gotemplating.fn.crossplane.io/v1beta1
+        kind: GoTemplate
+        source: Inline
+        # missingkey=error turns a typo'd field path into a loud pipeline
+        # failure instead of the string "<no value>" silently reaching the GCP
+        # API. It is also what makes `$env.projectID` below a real contract
+        # with environment.yaml: rename that key and this Composition stops,
+        # rather than creating resources in a project named "<no value>".
+        #
+        # `options` is a TOP-LEVEL field of GoTemplate, a sibling of `source`
+        # and `inline` — NOT a field inside `inline`, which accepts only
+        # `template` or `templates`. Verified 2026-09-16 by running
+        # `crossplane render` against function-go-templating v0.12.5: the
+        # nested spelling fails the pipeline with
+        # `unknown name "options"` in TemplateSourceInline.
+        options:
+          - missingkey=error
+        inline:
+          template: |
+            {{- $xr := .observed.composite.resource }}
+            {{- $claim := $xr.metadata.name }}
+            {{- $ns := $xr.metadata.namespace }}
+            {{- $spec := $xr.spec }}
+
+            {{- /*
+              The environment lives at a well-known context key whose name
+              contains dots and a slash, so it has to be reached with `index`.
+              Everything after that is ordinary field access, which is what
+              missingkey=error polices.
+            */ -}}
+            {{- $env := index .context "apiextensions.crossplane.io/environment" }}
+            {{- $project := $env.projectID }}
+            {{- $network := $env.network }}
+            {{- $dockerHub := $env.dockerHubRemote }}
+
+            {{- /*
+              ADR-0012: the namespace IS the System. Everything below is
+              derived from it plus the claim name, which is why this XRD
+              carries no owner, project or instance field.
+
+              ADR-0015 §2: the instance's external name is deterministic and
+              derived from the claim — <system>-<claim>. That single string is
+              the entire mechanism by which a cluster rebuild ADOPTS the
+              existing instance instead of creating a second one, because
+              Crossplane's Create policy applies only when no external
+              resource with that name exists.
+            */ -}}
+            {{- $instanceName := printf "%s-%s" $ns $claim }}
+            {{- $dbName := "app" }}
+            {{- $adminSecret := printf "%s-admin" $claim }}
+
+            {{- /*
+              Cloud SQL's Postgres username for a service account is the email
+              with `.gserviceaccount.com` removed — a database username length
+              limit, not a style choice (Cloud SQL IAM docs, confirmed in
+              ADR-0013). The System Composition creates this service account;
+              this Composition only names it.
+            */ -}}
+            {{- $iamUser := printf "%s@%s.iam" $ns $project }}
+
+            {{- /*
+              ADR-0014 §1: `size` is a class, and THIS is where it becomes a
+              machine type. A developer can never name a tier, so a bigger
+              instance is a platform decision made here, in review.
+
+              availabilityType: L is regional (a standby in a second zone,
+              failover in ~60s); S and M are single-zone. Verified 2026-09-16
+              against the provider-upjet-gcp v3.0.0 DatabaseInstance CRD: for
+              Postgres, REGIONAL additionally requires
+              backupConfiguration.pointInTimeRecoveryEnabled = true, which is
+              set below — and the XRD's CEL rules already guarantee L implies
+              tier critical and backups on, so the two can never disagree.
+            */ -}}
+            {{- $tier := "" }}
+            {{- $availability := "ZONAL" }}
+            {{- if eq $spec.size "S" }}
+            {{-   $tier = "db-f1-micro" }}
+            {{- else if eq $spec.size "M" }}
+            {{-   $tier = "db-custom-2-7680" }}
+            {{- else }}
+            {{-   $tier = "db-custom-4-15360" }}
+            {{-   $availability = "REGIONAL" }}
+            {{- end }}
+            {{- $pitr := and $spec.backups (eq $availability "REGIONAL") }}
+
+            {{- /*
+              The superuser password.
+
+              Generated once and then kept stable by reading it back off the
+              observed composed Secret. It must be read from `data` (base64)
+              and not `stringData`: the API server converts stringData away on
+              write, so an observed Secret never has it and the read-back
+              would miss every time, regenerating the password on every
+              reconcile and fighting the instance's rootPasswordSecretRef.
+
+              WITHIN one cluster's life that read-back is enough. ACROSS a
+              rebuild it is not: the Secret goes with the cluster, this branch
+              mints a fresh password, and Cloud SQL never receives it because
+              upjet injects the Secret's current value into both the Terraform
+              state and the config, so the provider never sees a change. See
+              ADMIN PASSWORD AND THE REBUILD in the header for the code
+              references, what the GRANT Job does about it, and the cross-repo
+              fix. Nothing here can close it: a value that outlives the cluster
+              has to be stored outside the cluster.
+
+              A password derived deterministically from the XR's uid would not
+              help either — the uid is regenerated with the XR — and it would
+              cost ADR-0013's rotation story, since deleting this Secret is
+              supposed to mint a NEW password and a derived one would come back
+              identical.
+            */ -}}
+            {{- $obsSecret := getComposedResource . "admin-secret" }}
+            {{- $password := "" }}
+            {{- if $obsSecret }}
+            {{-   $password = dig "data" "password" "" $obsSecret }}
+            {{- end }}
+            {{- if not $password }}
+            {{-   $password = randAlphaNum 32 | b64enc }}
+            {{- end }}
+
+            {{- /*
+              What the instance is actually reporting. status.atProvider field
+              names verified 2026-09-16 against the v3.0.0 CRD:
+              `privateIpAddress` ("The first private (PRIVATE) IPv4 address
+              assigned") and `connectionName`. Note these are NOT the
+              connection-secret key names, which are `privateIP`/`connectionName`
+              — this Composition reads status and writes its own ConfigMap
+              rather than asking the provider for a connection Secret.
+            */ -}}
+            {{- $obsInstance := getComposedResource . "instance" }}
+            {{- $privateIp := "" }}
+            {{- $connectionName := "" }}
+            {{- if $obsInstance }}
+            {{-   $privateIp = dig "status" "atProvider" "privateIpAddress" "" $obsInstance }}
+            {{-   $connectionName = dig "status" "atProvider" "connectionName" "" $obsInstance }}
+            {{- end }}
+
+            {{- /*
+              The GRANT job is named by a hash of exactly what it grants, so a
+              change to the instance, the database or the IAM user produces a
+              different Job rather than trying to patch an immutable
+              PodSpec. In M2 none of those three can change for a live claim —
+              all are derived from the namespace and the claim name, both
+              immutable — so in practice the hash is stable for the life of
+              the claim and the Job runs exactly once.
+
+              The hash is in the COMPOSITION RESOURCE NAME too, not only in
+              metadata.name. That is deliberate: if the grant spec ever does
+              change, the old resource name vanishes from desired state and
+              Crossplane garbage-collects the superseded Job, instead of
+              leaving an orphan owned by the XR forever.
+            */ -}}
+            {{- $grantHash := printf "%s|%s|%s" $instanceName $iamUser $dbName | sha256sum | trunc 10 }}
+
+            {{- /*
+              WHEN THE GRANT JOB IS ALLOWED TO EXIST.
+
+              Three preconditions, and getting this wrong is the difference
+              between a claim that converges on its own and one that needs a
+              human to delete a Job:
+
+              1. A private IP, because the IP is baked into the Job's args.
+              2. The `app` database is Ready. Before that, psql connects to a
+                 database that does not exist.
+              3. The IAM user is Ready. Before that, the GRANT names a role
+                 that does not exist.
+
+              (2) and (3) are not implied by (1). All three managed resources
+              become creatable at the same moment — when the instance reaches
+              RUNNABLE — but the provider reconciles them on its own schedule,
+              so the Job could easily win the race, and both failures are
+              non-transient within one pod.
+
+              The fourth condition is the escape hatch: once the Job exists in
+              observed state it is rendered unconditionally, and the private IP
+              is read back off its own annotation. Without that, a single
+              reconcile where the instance or a sibling flickers out of
+              observed state would drop the Job from desired state and
+              Crossplane would garbage-collect a COMPLETED job — destroying
+              both the grant's evidence and the XR's readiness.
+
+              getResourceCondition is nil-safe: given a resource that is not in
+              observed state it returns a condition with status "Unknown"
+              (function-go-templating v0.12.5 function_maps.go, read
+              2026-09-16), so no guard is needed around the lookups.
+
+              There is no window where the XR reports Ready with the Job
+              absent. In the reconcile where the last sibling turns Ready the
+              Job enters desired state, and function-auto-ready only ever marks
+              a resource ready once it also appears in OBSERVED state — so the
+              XR stays unready until the Job has actually completed.
+            */ -}}
+            {{- $obsJob := getComposedResource . (printf "grant-%s" $grantHash) }}
+            {{- if and (not $privateIp) $obsJob }}
+            {{-   $privateIp = dig "metadata" "annotations" "platform.thecloudgeek.io/instance-private-ip" "" $obsJob }}
+            {{- end }}
+            {{- $dbReady := eq (getResourceCondition "Ready" (getComposedResource . "database")).Status "True" }}
+            {{- $userReady := eq (getResourceCondition "Ready" (getComposedResource . "iam-user")).Status "True" }}
+            {{- $renderGrant := and $privateIp (or $obsJob (and $dbReady $userReady)) }}
+            ---
+            # The instance. Durable by three independent locks (ADR-0015 §1):
+            #   1. managementPolicies without Delete — Crossplane will observe,
+            #      create, update and late-initialise it, and will never issue
+            #      a delete, so removing the claim leaves the data (C-07(c)).
+            #      Note there is no `deletionPolicy: Orphan` to reach for on a
+            #      namespaced managed resource: verified 2026-09-16 against the
+            #      v3.0.0 CRD, `spec` on a *.gcp.m.upbound.io kind has exactly
+            #      forProvider, initProvider, managementPolicies,
+            #      providerConfigRef and writeConnectionSecretToRef. Only the
+            #      cluster-scoped twin has deletionPolicy. managementPolicies
+            #      is how durability is spelled here.
+            #   2. forProvider.deletionProtection — the Terraform-side guard.
+            #   3. settings.deletionProtectionEnabled — the Cloud SQL-side guard.
+            apiVersion: sql.gcp.m.upbound.io/v1beta1
+            kind: DatabaseInstance
+            metadata:
+              name: {{ $instanceName }}
+              namespace: {{ $ns }}
+              annotations:
+                {{ setResourceNameAnnotation "instance" }}
+                # Set explicitly, always. upjet's name initializer would
+                # otherwise copy metadata.name into this annotation, and a
+                # function-generated metadata.name is not something to name a
+                # Cloud SQL instance after.
+                crossplane.io/external-name: {{ $instanceName }}
+              labels:
+                platform.thecloudgeek.io/system: {{ $ns }}
+                platform.thecloudgeek.io/database: {{ $claim }}
+            spec:
+              managementPolicies: [Observe, Create, Update, LateInitialize]
+              forProvider:
+                databaseVersion: {{ $spec.engine }}
+                region: {{ $spec.region }}
+                deletionProtection: true
+                # The superuser password, read from the Secret this
+                # Composition also creates. This ref is LOCAL — {name, key},
+                # no namespace — on a namespaced managed resource, so the
+                # Secret must live in the claim's namespace, which it does.
+                # On the very first reconcile this Secret may not exist yet;
+                # the provider retries until it does.
+                rootPasswordSecretRef:
+                  name: {{ $adminSecret }}
+                  key: password
+                settings:
+                  tier: {{ $tier }}
+                  # MANDATORY, not decoration. The Cloud SQL API defaults
+                  # POSTGRES_16 and later to ENTERPRISE_PLUS, which supports
+                  # only db-perf-optimized-N-* machine types; every tier this
+                  # Composition uses is shared-core or custom and requires
+                  # ENTERPRISE. Omitting this fails at create with
+                  # "Invalid Tier (...) for (ENTERPRISE_PLUS) Edition"
+                  # (quoted from the v3.0.0 CRD's own field description, read
+                  # 2026-09-16).
+                  edition: ENTERPRISE
+                  availabilityType: {{ $availability }}
+                  # ADR-0015 §4: `cycle.sh park` sets this to NEVER between
+                  # sessions to suspend instance charges. Update is in the
+                  # management policy set, so the next reconcile pulls it back
+                  # to ALWAYS — the paved road restarts its own instance and
+                  # there is no `unpark` command to forget to run.
+                  activationPolicy: ALWAYS
+                  deletionProtectionEnabled: true
+                  databaseFlags:
+                    # The whole of ADR-0013 rests on this flag. Without it the
+                    # instance has no IAM authentication and the application
+                    # would need a password after all.
+                    - name: cloudsql.iam_authentication
+                      value: "on"
+                  backupConfiguration:
+                    enabled: {{ $spec.backups }}
+                    pointInTimeRecoveryEnabled: {{ $pitr }}
+                  ipConfiguration:
+                    # Private IP only. There is no public address to reach,
+                    # and this is a one-way door: Cloud SQL does not allow
+                    # disabling private IP on an instance afterwards.
+                    ipv4Enabled: false
+                    privateNetwork: {{ $network }}
+                    # sslMode is deliberately left at the API default
+                    # (ALLOW_UNENCRYPTED_AND_ENCRYPTED). Every client on the
+                    # paved road already uses TLS — the Auth Proxy always
+                    # does, and the GRANT job asks for sslmode=require — so
+                    # tightening to ENCRYPTED_ONLY changes nothing for them
+                    # and would silently break any operator connecting by
+                    # hand. It is a one-line follow-up, not an M2 omission.
+                  # ADR-0015 §4: `park` finds instances by label, not from a
+                  # hand-kept list, and ADR-0015's consequences make "did the
+                  # platform create this?" an auditable question. GCP label
+                  # keys allow only lowercase letters, digits, underscores and
+                  # dashes — no dots, no slashes — so the Kubernetes label
+                  # `platform.thecloudgeek.io/system` cannot be spelled here
+                  # and becomes `system`.
+                  userLabels:
+                    system: {{ $ns }}
+                    database: {{ $claim }}
+                    managed-by: crossplane
+                # `project` is intentionally unset: the ClusterProviderConfig
+                # named `default` carries projectID, and every namespaced
+                # managed resource defaults providerConfigRef to it.
+            ---
+            # The database the application uses. Durable for the same reason
+            # the instance is — dropping a database is as destructive as
+            # deleting the instance it lives in.
+            apiVersion: sql.gcp.m.upbound.io/v1beta1
+            kind: Database
+            metadata:
+              name: {{ printf "%s-%s" $instanceName $dbName }}
+              namespace: {{ $ns }}
+              annotations:
+                {{ setResourceNameAnnotation "database" }}
+                crossplane.io/external-name: {{ $dbName }}
+              labels:
+                platform.thecloudgeek.io/system: {{ $ns }}
+                platform.thecloudgeek.io/database: {{ $claim }}
+            spec:
+              managementPolicies: [Observe, Create, Update, LateInitialize]
+              forProvider:
+                # A literal, not an instanceRef. The reference form resolves
+                # by the managed resource's Kubernetes object name, while this
+                # field wants the Cloud SQL instance name — which is the
+                # external name above. Writing the literal keeps the two from
+                # drifting apart and makes the coupling visible.
+                instance: {{ $instanceName }}
+                # Lock 2 of ADR-0015 §1's three, spelled the only way this
+                # kind allows. The instance carries deletionProtection and
+                # settings.deletionProtectionEnabled; a sql Database has
+                # NEITHER — verified 2026-09-16 against the v3.0.0 CRD, whose
+                # forProvider is exactly charset, collation, deletionPolicy,
+                # instance, instanceRef, instanceSelector, project. So
+                # deletionPolicy is this kind's provider-side guard, and
+                # ABANDON means "stop managing it, do not drop it". Without
+                # this line one edit that put Delete back into
+                # managementPolicies above would drop the database and every
+                # table in it with nothing else in the way.
+                #
+                # This is the provider's forProvider-level deletionPolicy, not
+                # Crossplane's — Crossplane's does not exist on a namespaced
+                # managed resource.
+                deletionPolicy: ABANDON
+            ---
+            # The application's Postgres role. No password anywhere: Cloud SQL
+            # authenticates it from a short-lived token the Auth Proxy mints
+            # from the pod's Google identity (ADR-0013 §2).
+            apiVersion: sql.gcp.m.upbound.io/v1beta1
+            kind: User
+            metadata:
+              # Not `<instance>-app`: that is the sql Database object's name,
+              # and two composed objects sharing a name (legal, since the
+              # kinds differ) is a readability trap in `kubectl get`.
+              name: {{ printf "%s-iam-user" $instanceName }}
+              namespace: {{ $ns }}
+              annotations:
+                {{ setResourceNameAnnotation "iam-user" }}
+                crossplane.io/external-name: {{ $iamUser }}
+              labels:
+                platform.thecloudgeek.io/system: {{ $ns }}
+                platform.thecloudgeek.io/database: {{ $claim }}
+            spec:
+              forProvider:
+                instance: {{ $instanceName }}
+                type: CLOUD_IAM_SERVICE_ACCOUNT
+                # A DELIBERATE DEPARTURE FROM ADR-0015 §1, which says
+                # "everything else a Composition creates — users, IAM members,
+                # service accounts, in-cluster objects — is fully managed and
+                # deletes with its claim." This user does not.
+                #
+                # Quoting the v3.0.0 CRD's own description of this field:
+                # 'Defaults to "DELETE". This is useful for Postgres, where
+                # users cannot be deleted from the API if they have been
+                # granted SQL roles.' The GRANT job below grants exactly such
+                # roles, so DELETE would make claim deletion fail and leave
+                # the XR stuck with a finalizer. Note this is the provider's
+                # forProvider-level deletionPolicy, not Crossplane's.
+                #
+                # The consequence, stated plainly so nobody reads ADR-0015 and
+                # believes otherwise: deleting the claim leaves the Postgres
+                # role — holding ALL PRIVILEGES on database "app" — behind in
+                # the durable instance. An offboarded System therefore leaves
+                # an orphaned role whose only removal path is the human runbook
+                # in ADR-0015 §5, alongside the instance itself. Either that
+                # runbook grows a step or ADR-0015 §1 moves users into the
+                # durable set; it should not stay an unwritten difference.
+                deletionPolicy: ABANDON
+            ---
+            # The break-glass superuser password. ADR-0013 §3: the team may
+            # read it — it is their database — but nothing on the paved road
+            # mounts it. Its only routine consumer is the GRANT job below.
+            #
+            # `data`, not `stringData`, so the value can be read back on the
+            # next reconcile and stay stable (see the generation block above).
+            apiVersion: v1
+            kind: Secret
+            metadata:
+              name: {{ $adminSecret }}
+              namespace: {{ $ns }}
+              annotations:
+                {{ setResourceNameAnnotation "admin-secret" }}
+              labels:
+                platform.thecloudgeek.io/system: {{ $ns }}
+                platform.thecloudgeek.io/database: {{ $claim }}
+            type: Opaque
+            data:
+              password: {{ $password }}
+            ---
+            # What the application needs in order to connect. The team's
+            # Deployment reads these four values; nothing here is a secret,
+            # because in this design connecting is an IAM question and not a
+            # credential question.
+            #
+            # Values fill in as the instance comes up. That does not make the
+            # XR look ready early: function-auto-ready treats a ConfigMap as
+            # ready the moment it exists, but the instance and the GRANT job
+            # both publish real readiness, so the XR's Ready condition still
+            # means "you can log in".
+            apiVersion: v1
+            kind: ConfigMap
+            metadata:
+              name: {{ printf "%s-connection" $claim }}
+              namespace: {{ $ns }}
+              annotations:
+                {{ setResourceNameAnnotation "connection" }}
+              labels:
+                platform.thecloudgeek.io/system: {{ $ns }}
+                platform.thecloudgeek.io/database: {{ $claim }}
+            data:
+              connectionName: {{ $connectionName | quote }}
+              privateIp: {{ $privateIp | quote }}
+              databaseName: {{ $dbName | quote }}
+              iamUser: {{ $iamUser | quote }}
+            {{ if $renderGrant }}
+            ---
+            # The GRANT step. A Cloud SQL IAM database user is created with no
+            # privileges at all; this is the only way it gets any on a fresh
+            # instance (ADR-0013 context).
+            #
+            # Readiness is the reason this Job matters beyond the grant
+            # itself. function-auto-ready has a built-in health check for
+            # batch/v1 Job — ready only on Complete=True — so the XR reports
+            # Ready exactly when the application can actually log in, not
+            # merely when the instance exists. That is what C-07(a)'s "usable"
+            # is measured against.
+            #
+            # That same property is why the script below asks the application's
+            # own identity first, and only falls back to the superuser
+            # password: see ADMIN PASSWORD AND THE REBUILD in the header. A
+            # rebuilt cluster mints a new admin password that Cloud SQL never
+            # receives, so a password-only Job would fail forever on cycle 2
+            # and pin the XR at Ready=False.
+            #
+            # ttlSecondsAfterFinished is deliberately unset: the finished Job
+            # and its pod logs are the evidence that the grant ran, and they
+            # are small.
+            apiVersion: batch/v1
+            kind: Job
+            metadata:
+              name: {{ printf "%s-grant-%s" $claim $grantHash }}
+              namespace: {{ $ns }}
+              annotations:
+                {{ setResourceNameAnnotation (printf "grant-%s" $grantHash) }}
+                # Read back by this template if the instance is ever missing
+                # from observed state, so a completed Job is never dropped
+                # from desired state and garbage-collected.
+                platform.thecloudgeek.io/instance-private-ip: {{ $privateIp | quote }}
+              labels:
+                platform.thecloudgeek.io/system: {{ $ns }}
+                platform.thecloudgeek.io/database: {{ $claim }}
+            spec:
+              # Twelve pod attempts, each of which retries internally for ~10
+              # minutes (see the loop below). A finite backoffLimit with a
+              # short inner run is a trap on a Job whose PodSpec is immutable:
+              # once Kubernetes marks the Job Failed, Crossplane re-applies an
+              # identical manifest forever, nothing restarts, and the XR is
+              # pinned at Ready=False until a human deletes the Job. The
+              # generous budget means only a genuinely broken credential or
+              # network reaches that state, and the pod logs say which.
+              backoffLimit: 12
+              template:
+                metadata:
+                  labels:
+                    platform.thecloudgeek.io/system: {{ $ns }}
+                    platform.thecloudgeek.io/database: {{ $claim }}
+                spec:
+                  restartPolicy: OnFailure
+                  # The System's own Kubernetes service account, created by the
+                  # System Composition in this namespace and annotated onto the
+                  # System's Google service account. It is what lets step 1 of
+                  # the script log in as the APPLICATION'S identity, which is
+                  # the only credential that survives a cluster rebuild. A
+                  # Database claim cannot exist without a System namespace, so
+                  # this service account is always there.
+                  serviceAccountName: {{ $ns }}
+                  containers:
+                    - name: grant
+                      # ADR-0010: nodes are private and pull through an
+                      # Artifact Registry remote, never from the internet.
+                      # docker-hub is the remote; library/postgres is Docker
+                      # Hub's own path for the official image, unchanged.
+                      image: {{ $dockerHub }}/library/postgres:16-alpine
+                      # `command` overrides the image's ENTRYPOINT, so this
+                      # runs the script below instead of the postgres
+                      # docker-entrypoint script.
+                      command:
+                        - /bin/sh
+                        - -c
+                      args:
+                        - |
+                          set -u
+
+                          # Connecting by private IP rather than by connection
+                          # name: this Job runs inside the VPC, where the IP is
+                          # directly reachable, so it needs no proxy sidecar of
+                          # its own. sslmode=require encrypts the superuser
+                          # password on the wire and is also required by Cloud
+                          # SQL for a direct IAM login.
+                          BASE="host={{ $privateIp }} port=5432 dbname={{ $dbName }} sslmode=require"
+                          IAM_USER='{{ $iamUser }}'
+                          DB='{{ $dbName }}'
+
+                          # STEP 1 — ask the application's own identity whether
+                          # it already has what this Job would grant.
+                          #
+                          # Cloud SQL IAM database authentication accepts an
+                          # OAuth2 access token as the password, which is all
+                          # the Auth Proxy's --auto-iam-authn does; the GKE
+                          # metadata server hands this pod one for the System's
+                          # Google service account because of the
+                          # serviceAccountName above. busybox wget and sed are
+                          # in the alpine image, so no extra tooling is needed,
+                          # and any failure here simply falls through to step 2
+                          # — the worst case is the behaviour this Job had
+                          # before the check existed.
+                          #
+                          # Postgres 15+ removes CREATE on schema public from
+                          # PUBLIC, so has_schema_privilege is a real test of
+                          # whether the second GRANT below has run, not a test
+                          # of whether the user can merely connect.
+                          already_granted() {
+                            tok=$(wget -qO- --header='Metadata-Flavor: Google' \
+                              'http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token' \
+                              2>/dev/null | sed -n 's/.*"access_token" *: *"\([^"]*\)".*/\1/p')
+                            [ -n "${tok}" ] || return 1
+                            PGPASSWORD="${tok}" psql "${BASE} user=${IAM_USER}" -tAc \
+                              "SELECT has_schema_privilege('public', 'CREATE')" 2>/dev/null \
+                              | grep -qx t
+                          }
+
+                          # STEP 2 — grant, as the only role on a fresh
+                          # instance that can. Both statements are idempotent,
+                          # which is what makes a retried or re-run Job safe.
+                          # The second one is not optional: without it the
+                          # application can reach the database and still not
+                          # create a table in it.
+                          do_grant() {
+                            PGPASSWORD="${ADMIN_PASSWORD}" psql "${BASE} user=postgres" \
+                              --no-password --set=ON_ERROR_STOP=1 \
+                              -c "GRANT ALL PRIVILEGES ON DATABASE \"${DB}\" TO \"${IAM_USER}\";" \
+                              -c "GRANT ALL ON SCHEMA public TO \"${IAM_USER}\";"
+                          }
+
+                          n=0
+                          while [ "${n}" -lt 40 ]; do
+                            n=$((n + 1))
+                            if already_granted; then
+                              echo "grant already in place for ${IAM_USER} on \"${DB}\""
+                              exit 0
+                            fi
+                            if do_grant; then
+                              echo "granted ${IAM_USER} on \"${DB}\""
+                              exit 0
+                            fi
+                            echo "attempt ${n}/40 did not succeed; retrying in 15s"
+                            sleep 15
+                          done
+
+                          echo "could not grant after 40 attempts." >&2
+                          echo "If psql reported 'password authentication failed for user \"postgres\"', the {{ $adminSecret }} Secret no longer matches Cloud SQL — see ADMIN PASSWORD AND THE REBUILD in the Composition header." >&2
+                          exit 1
+                      env:
+                        # Not PGPASSWORD: the script sets PGPASSWORD per
+                        # connection, because step 1 uses an access token and
+                        # step 2 uses this password.
+                        - name: ADMIN_PASSWORD
+                          valueFrom:
+                            secretKeyRef:
+                              name: {{ $adminSecret }}
+                              key: password
+                      resources:
+                        requests:
+                          cpu: 50m
+                          memory: 64Mi
+                        limits:
+                          # An explicit CPU limit is MANDATORY here, not
+                          # tidiness. The System Composition puts a
+                          # ResourceQuota on this namespace with limits.cpu
+                          # set, and Kubernetes' rule is that a quota naming
+                          # limits.cpu requires every incoming container to
+                          # declare one (kubernetes.io, "Resource Quotas",
+                          # Resource Quota Per Container). Omit it and the Job
+                          # object applies cleanly — Crossplane creates Jobs,
+                          # not Pods — while the Job controller silently emits
+                          # FailedCreate "must specify limits.cpu" and never
+                          # produces a pod, leaving the XR unready with no
+                          # error anywhere Crossplane can see.
+                          cpu: 200m
+                          memory: 128Mi
+            {{ end }}
+            ---
+            # The XR's own status.
+            #
+            # This document carries NO composition-resource-name annotation,
+            # and that is the whole trick: function-go-templating merges a
+            # document matching the XR's own apiVersion and kind into the
+            # desired composite's status and composes nothing. Add the
+            # annotation and you would compose a second Database XR instead.
+            apiVersion: platform.thecloudgeek.io/v1alpha1
+            kind: Database
+            status:
+              connectionName: {{ $connectionName | quote }}
+              privateIp: {{ $privateIp | quote }}
+              databaseName: {{ $dbName | quote }}
+              iamUser: {{ $iamUser | quote }}
+              adminSecret: {{ $adminSecret | quote }}
+
+    # 3. Decide readiness. Must be last: it can only judge resources the
+    #    earlier steps put into desired state.
+    #
+    #    Every kind this Composition composes is covered without an explicit
+    #    `gotemplating.fn.crossplane.io/ready` annotation, which is worth
+    #    stating because it is not true of the System Composition:
+    #      - Secret and ConfigMap are registered as always-ready-on-existence
+    #        in function-auto-ready v0.6.9's health-check registry.
+    #      - Job has a real check: ready only on Complete=True.
+    #      - The three managed resources publish a Ready condition of their
+    #        own, which is the fallback path for any unregistered kind.
+    #    Nothing here is an Argo AppProject, RoleBinding or ResourceQuota —
+    #    the kinds with no Ready condition and no registered check, which
+    #    would otherwise leave the XR Ready=False forever.
+    - step: ready
+      functionRef:
+        name: function-auto-ready

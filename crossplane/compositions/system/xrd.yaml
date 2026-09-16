@@ -1,0 +1,253 @@
+# The System API — the whole self-service surface a tenant sees.
+#
+# WHY this file exists, before what it says: ADR-0012 decided that a System is
+# one deployable unit with its own namespace, and that a team is a FIELD on a
+# System rather than a System of its own. That decision only becomes real if
+# the schema enforces it, because a schema is the one place a mistake is caught
+# before anything is created. So this XRD carries five fields of intent and
+# nothing that names a Kubernetes or GCP resource: no namespace, no quota
+# numbers, no repository path, no IAM role. The Composition next to this file
+# holds all of that.
+#
+# ADR-0014 §1 ("schema denies first") is the other reason to read this closely.
+# Everything expressible as an enum, a pattern or a CEL rule belongs HERE, not
+# in Kyverno, because an API-server rejection names the offending field and
+# arrives the instant `kubectl apply` runs, while a policy rejection names a
+# policy and a rule. Kyverno covers only what a schema structurally cannot see
+# (who the requester is; how many objects already exist in a namespace).
+#
+# Field descriptions below are developer-facing on purpose: they are what
+# `kubectl explain system.spec.owner.team` prints, and the paved road's docs
+# are worth nothing if the API cannot explain itself at the terminal.
+#
+# Verified 2026-09-16 against Crossplane 2.3.5's
+# apiextensions.crossplane.io_compositeresourcedefinitions.yaml CRD (v2 schema):
+#   - `scope` accepts only Namespaced (default) and Cluster. LegacyCluster is a
+#     v1-only value.
+#   - `spec.claimNames` and `spec.connectionSecretKeys` are rejected by CEL on
+#     the XRD itself in v2 ("Claims aren't supported"; "XR connection secrets
+#     aren't supported"). Neither appears here.
+#   - Reserved: a schema must not define spec.crossplane, status.crossplane or
+#     status.conditions. Crossplane injects those and overrides anything with
+#     the same name. None of them appear here.
+#
+# Settled 2026-09-16 by running `crossplane xrd convert xrd.yaml` (CLI v2.x)
+# and reading the generated CRD, because the M2 research spike could not read
+# the XRD -> CRD generator and left it open: both `default:` (spec.tier) and
+# `x-kubernetes-validations` (the name rule below) survive the conversion
+# intact, so the CEL rules in this file and in the Database XRD are load-bearing
+# as written. The generated CRD's printer columns are Team/Tier/Size followed by
+# Crossplane's own SYNCED/READY/COMPOSITION/COMPOSITIONREVISION/AGE — which is
+# why only three are declared below.
+apiVersion: apiextensions.crossplane.io/v2
+kind: CompositeResourceDefinition
+metadata:
+  # Must be <plural>.<group>. Crossplane rejects any other name.
+  name: systems.platform.thecloudgeek.io
+  annotations:
+    # Sync wave 0 *within* the compositions Application: the XRD has to be
+    # Established before the Composition that references it is admitted.
+    # Between Applications the ordering is apps/compositions.yaml's wave 3.
+    argocd.argoproj.io/sync-wave: "0"
+spec:
+  group: platform.thecloudgeek.io
+
+  # Cluster-scoped, and this is load-bearing rather than a style choice. A
+  # Cluster XR may compose cluster-scoped objects AND namespaced objects in ANY
+  # namespace; a Namespaced XR may only compose namespaced objects in its own
+  # namespace (crossplane v2.3 internal/controller/apiextensions/composite/
+  # composition_render.go, read 2026-09-16). The System Composition has to put
+  # an AppProject and an Application into `argocd` while putting a RoleBinding,
+  # a quota and cloud resources into the tenant's own namespace — which only a
+  # Cluster XR can do. It is also the honest scope: a System CREATES the
+  # namespace, so it cannot live inside one.
+  #
+  # `scope` is immutable (CEL `self == oldSelf` on the XRD type). Changing it
+  # later is a delete-and-recreate of the XRD and every System with it.
+  scope: Cluster
+
+  names:
+    kind: System
+    plural: systems
+
+  versions:
+    - name: v1alpha1
+      served: true
+      # Exactly one version, and it must be both served and referenceable for a
+      # Composition to name it in compositeTypeRef.
+      referenceable: true
+
+      # What `kubectl get systems` shows, and ONLY what Crossplane does not
+      # already provide. Crossplane appends SYNCED, READY, COMPOSITION,
+      # COMPOSITIONREVISION (priority 1) and AGE to every XR CRD it generates
+      # — verified 2026-09-16 against crossplane-runtime v2.3.4 (the version
+      # crossplane v2.3.5's go.mod pins) pkg/xcrd/crd.go:93, which appends
+      # CompositeResourcePrinterColumns (pkg/xcrd/schemas.go:347) to whatever
+      # this XRD declares. Declaring Ready/Synced/Age here as well would print
+      # each of them twice and push the default output past a terminal width;
+      # the C-05 finish line ("the System reports Ready") is on screen either
+      # way. So this list is the three columns that are ours alone: who owns
+      # it, what we owe it, and how big it is.
+      additionalPrinterColumns:
+        - name: Team
+          type: string
+          jsonPath: .spec.owner.team
+        - name: Tier
+          type: string
+          jsonPath: .spec.tier
+        - name: Size
+          type: string
+          jsonPath: .spec.size
+
+      schema:
+        openAPIV3Schema:
+          type: object
+          description: >-
+            A System is one deployable unit — a service repo — with its own
+            namespace, quota, RBAC, Argo CD project, container registry and
+            cloud identity. One file in the `systems` repo is one System.
+            Everything it materialises is derived from the five fields below;
+            nothing here names a Kubernetes or GCP resource.
+
+          # The name is the identity, so the name carries the tightest
+          # constraint in the whole API. Three separate systems have to accept
+          # it, and the intersection is narrower than any one of them:
+          #   1. Kubernetes namespace   — RFC 1123 label, up to 63 chars.
+          #   2. Artifact Registry repo — lowercase letters, digits, dashes.
+          #   3. GCP service account ID — 6 to 30 characters, must start with a
+          #      letter, lowercase letters/digits/dashes only
+          #      (cloud.google.com/iam/docs/service-accounts-create, read
+          #      2026-09-16). This is the binding constraint: the 6-character
+          #      FLOOR is real, and it is the one nobody expects.
+          # Enforcing it here means a bad name fails at `kubectl apply` with the
+          # field named, instead of halfway through a Composition with a
+          # namespace already created and a ServiceAccount MR stuck in an
+          # unrecoverable provider error.
+          #
+          # Kubernetes CEL exposes metadata.name at the root of the object
+          # (kubernetes.io, "Validation rules" — apiVersion, kind,
+          # metadata.name and metadata.generateName are always accessible from
+          # the root). A rule on `spec` could not see it, which is why this one
+          # sits here rather than below.
+          x-kubernetes-validations:
+            - rule: "self.metadata.name.matches('^[a-z][a-z0-9-]{4,28}[a-z0-9]$')"
+              message: >-
+                A System name must be 6-30 characters, start with a lowercase
+                letter, end with a letter or digit, and contain only lowercase
+                letters, digits and dashes. The name becomes a GCP service
+                account ID, which has exactly these limits.
+
+          properties:
+            spec:
+              type: object
+              description: The intent. What this System is, not how it is built.
+              properties:
+
+                owner:
+                  type: object
+                  description: >-
+                    Who owns this System and where its code lives. These are the
+                    only two fields that ever change hands.
+                  properties:
+                    team:
+                      type: string
+                      description: >-
+                        The owning team, as a bare name. Resolved at composition
+                        time to the Google Group <team>@thecloudgeek.io by naming
+                        convention — there is no second file mapping teams to
+                        groups, because a second file would be a second binding
+                        point (ADR-0012 §3). The group must already exist and be
+                        nested under gke-security-groups@thecloudgeek.io, or the
+                        RoleBinding this composes resolves to nobody. Changing
+                        this one line is the whole of a team handover.
+                      # The intersection of "valid Google Group local part" and
+                      # "valid Kubernetes label value", because the team name is
+                      # both (ADR-0012, "Team names carry constraints"). Label
+                      # values additionally cap at 63 characters.
+                      pattern: '^[a-z0-9]([-a-z0-9]*[a-z0-9])?$'
+                      minLength: 2
+                      maxLength: 63
+                    repo:
+                      type: string
+                      description: >-
+                        The GitHub repository this System deploys from, as
+                        "org/name". The Composition points the tenant's Argo CD
+                        Application at https://github.com/<repo>, path k8s/,
+                        revision main. Carried onto composed resources as the
+                        annotation platform.thecloudgeek.io/repo rather than a
+                        label, because "/" is not a legal label value.
+                      pattern: '^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$'
+                      maxLength: 128
+                  required:
+                    - team
+                    - repo
+
+                tier:
+                  type: string
+                  description: >-
+                    Service tier — what the platform owes this System when it
+                    breaks. In M2 this rides along on labels so the inventory
+                    query exists before the paging policy does; nothing reads it
+                    yet. "critical" is also the gate the Database API requires
+                    before it will hand out its largest instance size.
+                  enum:
+                    - standard
+                    - critical
+                  default: standard
+
+                securityTier:
+                  type: string
+                  description: >-
+                    Data sensitivity. "internal" is ordinary company-internal
+                    data. "restricted" is reserved for tighter policy in a later
+                    milestone and carries no extra controls today — it is
+                    declared now so the label exists before the control does.
+                  enum:
+                    - internal
+                    - restricted
+
+                size:
+                  type: string
+                  description: >-
+                    Quota class, not CPU numbers. The Composition maps S/M/L to
+                    a ResourceQuota (S = 2 CPU / 4Gi requested, 4 CPU / 8Gi
+                    limit, 20 pods; M doubles it; L quadruples it). Keeping it a
+                    class is what lets a future Composition map a System to a
+                    whole GCP project — which has no ResourceQuota but does have
+                    a size — without the schema changing (ADR-0012 §6).
+                  enum:
+                    - S
+                    - M
+                    - L
+
+              required:
+                - owner
+                - securityTier
+                - size
+
+            status:
+              type: object
+              description: >-
+                What the platform built. Every field here is a name a developer
+                needs and would otherwise have to ask for.
+              properties:
+                namespace:
+                  type: string
+                  description: The Kubernetes namespace this System owns.
+                appProject:
+                  type: string
+                  description: >-
+                    The Argo CD AppProject this System's Application runs under.
+                registry:
+                  type: string
+                  description: >-
+                    The Artifact Registry repository to push this System's images
+                    to, as a full docker path. `docker push <registry>/<image>:<tag>`.
+                gsaEmail:
+                  type: string
+                  description: >-
+                    The Google service account this System's workloads run as.
+                    Pods get it by setting serviceAccountName to the System's
+                    name; the Workload Identity binding is already in place.
+                    This is the identity Cloud SQL sees when a Database claim in
+                    this namespace grants IAM database access (ADR-0013 §1).
