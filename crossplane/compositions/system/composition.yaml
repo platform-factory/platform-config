@@ -61,6 +61,14 @@
 # (`roleRef` is the only immutable field on a RoleBinding). Predicted here,
 # before the run, so the result is a measurement rather than a surprise.
 #
+# MEASURED 2026-09-16, first run: the prediction was right about WHICH three
+# and wrong about HOW. The three objects kept their names, so upjet was asked
+# to update them in place — and refused ("requires replacing it"), forever,
+# with the cloud bindings still granting the old team and the System still
+# reporting Ready. The three now carry the team in their names (see the
+# ProjectIAMMember loop), so a move composes new objects and garbage-collects
+# the old ones. "Re-created" is now literal, and the count is still three.
+#
 # ----------------------------------------------------------------------------
 # READINESS: the single biggest way this Composition can fail
 # ----------------------------------------------------------------------------
@@ -833,27 +841,44 @@ spec:
             */ -}}
             {{- $sqlRoles := dict "sql-client" "roles/cloudsql.client" "sql-instance-user" "roles/cloudsql.instanceUser" }}
             {{- $sqlPrincipals := dict "app" (printf "serviceAccount:%s" $gsa) "team" (printf "group:%s" $group) }}
+            {{- /*
+              WHY THE TEAM IS PART OF THE OBJECT NAME for the two "team"
+              members (and for the registry writer below). Learned on the
+              live C-06 run, 2026-09-16: an IAM-member resource cannot change
+              its `member` in place — Terraform would replace it — and upjet
+              does NOT perform replacements: the update is refused with
+              "refuse to update the external resource because the following
+              update requires replacing it", forever, while the cloud binding
+              keeps granting the OLD team. Worse, the managed resource's Ready
+              condition stayed True from its original creation, so the System
+              reported Ready with the grant silently stale. Naming the object
+              after the team turns a team move into what the ADR predicted it
+              would be: a NEW member is composed and the old one, no longer
+              desired, is garbage-collected by Crossplane — which removes the
+              old binding. Two objects change hands; nothing is asked to
+              mutate what it cannot.
+            */ -}}
             {{- range $roleSuffix, $role := $sqlRoles }}
             {{- range $who, $member := $sqlPrincipals }}
+            {{- $suffix := $who }}{{- if eq $who "team" }}{{- $suffix = printf "team-%s" $team }}{{- end }}
             ---
             apiVersion: cloudplatform.gcp.m.upbound.io/v1beta1
             kind: ProjectIAMMember
             metadata:
-              name: {{ $name }}-{{ $roleSuffix }}-{{ $who }}
+              name: {{ $name }}-{{ $roleSuffix }}-{{ $suffix }}
               namespace: {{ $name }}
               labels:
                 {{- $labels | toYaml | nindent 4 }}
               annotations:
-                {{ setResourceNameAnnotation (printf "iam-%s-%s" $roleSuffix $who) }}
+                {{ setResourceNameAnnotation (printf "iam-%s-%s" $roleSuffix $suffix) }}
             spec:
               forProvider:
                 project: {{ $project }}
                 role: {{ $role }}
                 # Team-dependent carriers 5 and 6 of 6 when $who is "team"
                 # (ADR-0013 §5) — and two of the three entries in C-06's
-                # "re-created" column: changing `member` replaces an
-                # IdentifierFromProvider IAM-member resource rather than
-                # updating it.
+                # "re-created" column. Re-created literally: see the note
+                # above the loop for why the team is in the object's name.
                 member: {{ $member | quote }}
             {{- end }}
             {{- end }}
@@ -931,12 +956,17 @@ spec:
             apiVersion: artifact.gcp.m.upbound.io/v1beta1
             kind: RegistryRepositoryIAMMember
             metadata:
-              name: {{ $name }}-registry-writer
+              # The team is in the name for the reason given above the
+              # ProjectIAMMember loop: an IAM member cannot change `member` in
+              # place, and upjet refuses the replacement (C-06 live run,
+              # 2026-09-16), so a team move must compose a new object and let
+              # the old one be garbage-collected.
+              name: {{ $name }}-registry-writer-{{ $team }}
               namespace: {{ $name }}
               labels:
                 {{- $labels | toYaml | nindent 4 }}
               annotations:
-                {{ setResourceNameAnnotation "registry-writer" }}
+                {{ setResourceNameAnnotation (printf "registry-writer-%s" $team) }}
             spec:
               forProvider:
                 project: {{ $project }}
