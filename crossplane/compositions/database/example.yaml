@@ -1,0 +1,48 @@
+# The claim a service team writes. This is the whole developer-facing surface
+# of a Postgres database on the paved road.
+#
+# It does not live here in the running platform — this file is the worked
+# example and the input to `crossplane render`. The real one is meant to live
+# in the service's own repo under `k8s/` (it is already written, at
+# `svc-hello/k8s/database.yaml`), where the team owns it and Argo CD syncs it
+# into the System's namespace through the System's AppProject.
+#
+# ── RESOLVED 2026-09-16, recorded because it was briefly open ───────────────
+# An earlier draft of the System Composition put
+# `group: platform.thecloudgeek.io, kind: "*"` on the tenant AppProject's
+# `namespaceResourceBlacklist`, which would have made Argo CD refuse this exact
+# file with "resource platform.thecloudgeek.io:Database is not permitted in
+# project <system>" — killing the flagship flow. That entry is gone. The
+# Composition's AppProject block now carries the reasoning under "NOT BLOCKED":
+# the group stays open because the claim IS the paved road's entry point, the
+# one kind a tenant must not mint (`System`) is already denied because it is
+# cluster-scoped and `clusterResourceWhitelist` is deliberately absent, and how
+# MANY claims a namespace may hold is Kyverno's `database-claim-budget`.
+# If a future NAMESPACED kind in this group is ever platform-only, blacklist
+# that kind by name — never the whole group.
+# ────────────────────────────────────────────────────────────────────────────
+#
+# Note what is absent: no project, no VPC, no machine type, no instance name,
+# no user, no password, and no team. The namespace IS the System (ADR-0012),
+# so the Composition derives the Cloud SQL instance name (`svc-hello-main`),
+# the IAM database user (`svc-hello@platform-factory-ref.iam`) and every label
+# from the namespace and the claim's name.
+#
+# Validate this file before opening the PR — that is the first and clearest
+# gate (ADR-0014 §4), and the only one that fires before merge:
+#
+#   crossplane resource validate xrd.yaml example.yaml
+apiVersion: platform.thecloudgeek.io/v1alpha1
+kind: Database
+metadata:
+  name: main
+  namespace: svc-hello
+spec:
+  engine: POSTGRES_16
+  region: us-central1
+  size: S
+  backups: true
+  # tier defaults to standard; spelled out here so the example shows the
+  # whole surface. Setting size: L without tier: critical is rejected by the
+  # XRD's CEL rule, with a message aimed at whoever typed it.
+  tier: standard

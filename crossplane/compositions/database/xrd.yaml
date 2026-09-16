@@ -1,0 +1,220 @@
+# The Database API a service team writes in its own repo.
+#
+# ADR-0014 is the reason this schema looks the way it does: "constraints that
+# a schema can express live in the schema." Every field here is intent
+# (how big, how important, what engine) and never mechanism. There is no
+# `tier: db-custom-96-624000` a developer could set, no `machineType`, no raw
+# `settings` passthrough — the denial for "give me an oversized instance" is
+# that the field cannot say it, and the developer meets that denial in the
+# pull request via `crossplane resource validate`, before the API server and
+# long before a Composition.
+#
+# Scope is Namespaced on purpose. By ADR-0012 the namespace IS the System, so
+# the claim's namespace carries the whole ownership answer and this XRD needs
+# no team, project or instance field. The Composition derives the Cloud SQL
+# instance name, the IAM database user and every label from the namespace and
+# the claim name.
+#
+# Verified 2026-09-16 against the apiextensions.crossplane.io XRD CRD at
+# Crossplane v2.3.5: `spec.scope` on apiextensions.crossplane.io/v2 accepts
+# only `Namespaced` (default) and `Cluster` and is immutable; `spec.claimNames`
+# and `spec.connectionSecretKeys` are rejected outright by CEL rules on the
+# XRD itself ("Claims aren't supported in apiextensions.crossplane.io/v2");
+# and the schema must not define `spec.crossplane`, `status.crossplane` or
+# `status.conditions`, which Crossplane injects and would override.
+#
+# Changing this schema requires a Crossplane pod restart to take effect
+# (docs.crossplane.io v2.3, composite-resource-definitions). That cost is the
+# point: allowed regions and sizes should change rarely and deliberately.
+apiVersion: apiextensions.crossplane.io/v2
+kind: CompositeResourceDefinition
+metadata:
+  # Must be <plural>.<group>.
+  name: databases.platform.thecloudgeek.io
+  annotations:
+    # Wave 0 inside apps/compositions.yaml. Crossplane generates a CRD from
+    # this XRD, and the Composition below it names that kind in its
+    # compositeTypeRef — applied together, the Composition can reach the API
+    # server before the kind exists.
+    argocd.argoproj.io/sync-wave: "0"
+spec:
+  scope: Namespaced
+  group: platform.thecloudgeek.io
+  names:
+    kind: Database
+    plural: databases
+    singular: database
+    shortNames:
+      - db
+  versions:
+    - name: v1alpha1
+      served: true
+      # Exactly one version, and a Composition can only reference a version
+      # marked referenceable.
+      referenceable: true
+      additionalPrinterColumns:
+        - name: Engine
+          type: string
+          jsonPath: .spec.engine
+        - name: Size
+          type: string
+          jsonPath: .spec.size
+        - name: Region
+          type: string
+          jsonPath: .spec.region
+        - name: Connection
+          type: string
+          jsonPath: .status.connectionName
+        # No Ready and no Age column here on purpose. Crossplane appends
+        # SYNCED, READY, COMPOSITION, COMPOSITIONREVISION and AGE to whatever
+        # this list holds — verified 2026-09-16 by generating the CRD from this
+        # XRD with `crossplane xrd convert` — so spelling Ready or Age out
+        # would print each of them twice in `kubectl get db`.
+      schema:
+        openAPIV3Schema:
+          type: object
+          description: >-
+            A Postgres database for one System. Creating this claim in your
+            System's namespace gives you a private Cloud SQL instance, a
+            database named "app", and login for your System's own identity —
+            no password for your application to hold.
+
+          # The claim's NAME is a field of this API too, even though it is not
+          # under `spec`, and it is load-bearing in five places: the Cloud SQL
+          # instance is named `<namespace>-<name>`, and the Secret, the
+          # ConfigMap, the GRANT Job and two managed resources are all named
+          # from it. Kubernetes would accept `main.db` — a namespaced object's
+          # name is an RFC 1123 *subdomain*, so dots are legal — and Cloud SQL
+          # would then reject the instance ID permanently, after the Secret and
+          # the durable sibling resources had already been created. ADR-0014 §1
+          # says the schema denies first; this is the rule that makes it do so.
+          #
+          # 34 characters is the ceiling because the GRANT Job is named
+          # `<name>-grant-<10 hex>` and Kubernetes appends 6 more characters to
+          # build its pod's name, which must fit in 63.
+          #
+          # Kubernetes CEL exposes metadata.name at the root of the object
+          # (kubernetes.io, "Validation rules" — apiVersion, kind,
+          # metadata.name and metadata.generateName are always accessible from
+          # the root). A rule on `spec` could not see it. The System XRD
+          # carries the same rule for the same reason, with a tighter range.
+          x-kubernetes-validations:
+            - rule: "self.metadata.name.matches('^[a-z][a-z0-9-]{0,32}[a-z0-9]$')"
+              message: >-
+                A database name must be 2-34 characters, start with a lowercase
+                letter, end with a letter or digit, and contain only lowercase
+                letters, digits and dashes. The name becomes part of the Cloud
+                SQL instance name <system>-<name>, which has exactly these
+                limits.
+
+          properties:
+            spec:
+              type: object
+              description: What you want. Everything else is the platform's job.
+              # Cross-field rules go on the object whose fields they compare,
+              # so they belong on `spec`, not on a leaf. Kubernetes applies
+              # defaults BEFORE these run, so `tier` and `backups` are always
+              # present here even when the developer omitted them.
+              #
+              # The messages are written for the developer who typed the YAML,
+              # not for the platform team (ADR-0014 §2). They say what to do
+              # next, not which rule fired.
+              x-kubernetes-validations:
+                - rule: "self.size != 'L' || self.tier == 'critical'"
+                  message: >-
+                    size L is only available to a critical-tier database. Set
+                    tier: critical if this database really is business
+                    critical, otherwise use size M.
+                - rule: "!has(self.backups) || self.backups || self.size == 'S'"
+                  message: >-
+                    backups can only be turned off on a size S database.
+                    Anything larger keeps backups on.
+              properties:
+                engine:
+                  type: string
+                  description: >-
+                    Postgres major version. Only versions the platform
+                    currently supports are listed; ask the platform team
+                    before planning on anything else.
+                  enum:
+                    - POSTGRES_16
+                    - POSTGRES_17
+                region:
+                  type: string
+                  description: >-
+                    Where the data lives. Keep it in the same region as the
+                    cluster (us-central1) unless you have a reason not to —
+                    a cross-region database adds latency to every query.
+                  enum:
+                    - us-central1
+                    - us-east1
+                size:
+                  type: string
+                  description: >-
+                    Size class, not a machine type. S is a shared-core
+                    instance for development and low traffic, M is a
+                    2 vCPU / 7.5 GB instance, L is 4 vCPU / 15 GB and
+                    regional (high availability). The platform maps the class
+                    to a machine type and can change that mapping without
+                    you editing this file.
+                  enum:
+                    - S
+                    - M
+                    - L
+                backups:
+                  type: boolean
+                  default: true
+                  description: >-
+                    Automated daily backups and point-in-time recovery. On by
+                    default, and only a size S database may turn it off.
+                tier:
+                  type: string
+                  default: standard
+                  description: >-
+                    Service tier of this database — how much the business
+                    loses if it is down. critical unlocks size L (high
+                    availability); it does not change anything else in M2.
+                  enum:
+                    - standard
+                    - critical
+              required:
+                - engine
+                - region
+                - size
+            status:
+              type: object
+              description: >-
+                What the platform built. Everything your application needs to
+                connect is also written to the ConfigMap named
+                <claim>-connection in your namespace.
+              properties:
+                connectionName:
+                  type: string
+                  description: >-
+                    The Cloud SQL connection name, project:region:instance.
+                    This is the last argument to the Cloud SQL Auth Proxy
+                    sidecar.
+                privateIp:
+                  type: string
+                  description: >-
+                    The instance's private IP. Informational — your
+                    application should talk to the proxy sidecar on
+                    127.0.0.1:5432, not to this address.
+                databaseName:
+                  type: string
+                  description: The database to connect to. Always "app".
+                iamUser:
+                  type: string
+                  description: >-
+                    The Postgres user your application logs in as. It is your
+                    System's Google service account with the
+                    .gserviceaccount.com suffix removed (Cloud SQL's username
+                    length limit), and it has no password — the proxy mints a
+                    token from the pod's identity.
+                adminSecret:
+                  type: string
+                  description: >-
+                    Name of the Secret in your namespace holding the Postgres
+                    superuser password. Break-glass only: nothing on the paved
+                    road mounts it, and the platform's GRANT job is its only
+                    routine consumer.

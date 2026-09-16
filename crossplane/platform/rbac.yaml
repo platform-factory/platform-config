@@ -1,0 +1,121 @@
+# Crossplane's permission to create the things the M2 Compositions compose.
+#
+# WHY THIS IS NEEDED AT ALL. Crossplane applies every composed resource with
+# its OWN service account (crossplane-system/crossplane), not the requester's.
+# Its core ClusterRole covers the Crossplane API groups plus a short list of
+# built-ins, and nothing else:
+#
+#   "Crossplane uses its service account to create the composed resources that
+#    a function pipeline returns... You must grant Crossplane access to compose
+#    any other kind of resource... The ClusterRole must aggregate to
+#    Crossplane's primary ClusterRole."
+#   (docs.crossplane.io/v2.3, composition/compositions, "Grant access to
+#    composed resources", read 2026-09-16)
+#
+# HOW AGGREGATION WORKS HERE. Verified 2026-09-16 against
+# https://raw.githubusercontent.com/crossplane/crossplane/v2.3.5/cluster/charts/crossplane/templates/clusterrole.yaml:
+# when `rbacManager.deploy` is true — the chart default, and this repo's
+# vendored charts/crossplane/values.yaml keeps it (line 96) — the `crossplane`
+# ClusterRole is an AGGREGATED role selecting
+# `rbac.crossplane.io/aggregate-to-crossplane: "true"`. Any ClusterRole
+# carrying that label has its rules folded in. Without the label the rules
+# below are inert: nothing errors, the composed applies just fail Forbidden.
+#
+# WHAT CORE ALREADY GRANTS, from that same file, so this role adds only the
+# gap: events; CRDs; secrets; serviceaccounts and services ("*"); the
+# apiextensions/ops/pkg/protection.crossplane.io groups ("*"); deployments;
+# configmaps and leases; webhook configurations. Missing for M2 and added
+# here: namespaces, resourcequotas, rolebindings, batch jobs, and argoproj.io.
+#
+# ORDERING. Wave 2, alongside the ClusterProviderConfig: Crossplane must hold
+# these before the first System XR reconciles, or the composed applies fail
+# Forbidden and the XR sits Degraded until someone reads the events.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: platform-factory:aggregate-to-crossplane
+  labels:
+    # The whole mechanism. Removing this label silently disables this file.
+    rbac.crossplane.io/aggregate-to-crossplane: "true"
+rules:
+  # --- System Composition (ADR-0012 §4) ---
+  #
+  # list and watch are not padding. Crossplane reads composed and required
+  # resources through a CACHED client, so an informer starts for each kind it
+  # touches, and an informer needs list+watch as well as get. A role with only
+  # get/create here fails at startup of the watch, not at the apply.
+  - apiGroups: [""]
+    resources: [namespaces, resourcequotas]
+    verbs: [get, list, watch, create, update, patch, delete]
+
+  # The tenant's Argo AppProject and Application, both composed into the
+  # `argocd` namespace. Legal because the System XR is Cluster-scoped: a
+  # cluster-scoped XR may own namespaced objects in ANY namespace (Kubernetes
+  # forbids only the reverse). A Namespaced XR could not do this.
+  - apiGroups: [argoproj.io]
+    resources: [appprojects, applications]
+    verbs: [get, list, watch, create, update, patch, delete]
+
+  # The RoleBinding that gives the owning team's Google group admin rights in
+  # its own namespace.
+  - apiGroups: [rbac.authorization.k8s.io]
+    resources: [rolebindings]
+    verbs: [get, list, watch, create, update, patch, delete]
+
+  # THE ESCALATION RULE, and why the next rule looks odd.
+  #
+  # Kubernetes refuses to let you hand out a permission you do not hold
+  # yourself: "You can only create/update a role binding if you already have
+  # all the permissions contained in the referenced role... or if you have
+  # been authorized to perform the `bind` verb on the referenced role."
+  # (kubernetes.io, "Using RBAC Authorization", Restrictions on role binding
+  # creation or update, read 2026-09-16.)
+  #
+  # So creating a RoleBinding to ClusterRole `admin` requires Crossplane to
+  # either hold everything `admin` confers — a huge, open-ended grant that
+  # grows whenever a new CRD aggregates into admin — or hold `bind` on that
+  # one ClusterRole by name. `bind` with resourceNames is by far the smaller
+  # grant, and it doubles as an explicit allow-list: this is the complete set
+  # of roles the platform may ever hand a tenant. Adding a role to a
+  # Composition means adding its name here, in a reviewable diff.
+  #
+  # `escalate` is deliberately absent. It governs CREATING or UPDATING Roles
+  # and ClusterRoles, which neither Composition does — they only bind existing
+  # ones. Granting it would let Crossplane author arbitrary roles for itself.
+  #
+  # WHY `crossplane-edit` IS ON THE LIST NEXT TO `admin`. Crossplane's RBAC
+  # manager aggregates managed-resource and XR kinds into ClusterRoles named
+  # `crossplane-admin` / `crossplane-edit` / `crossplane-view`, using its OWN
+  # label `rbac.crossplane.io/aggregate-to-edit` — NOT Kubernetes'
+  # `rbac.authorization.k8s.io/aggregate-to-edit`. Verified 2026-09-16 by
+  # grepping crossplane v2.3.x's rbac-manager-managed-clusterroles.yaml for
+  # the Kubernetes label: zero hits. The consequence is counter-intuitive and
+  # worth stating plainly: a RoleBinding to the BUILT-IN `admin` ClusterRole
+  # grants a team nothing on `*.gcp.m.upbound.io` managed resources and
+  # nothing on `platform.thecloudgeek.io` XRs — so a team bound only to
+  # `admin` could not create the very Database claim the paved road is built
+  # around. Whichever ClusterRole the System Composition ends up binding, the
+  # `bind` permission for it has to be here; both names are listed so the
+  # Composition can bind `admin` for ordinary workloads and `crossplane-edit`
+  # for the claim API without a second PR to this file.
+  - apiGroups: [rbac.authorization.k8s.io]
+    resources: [clusterroles]
+    verbs: [bind]
+    resourceNames: [admin, crossplane-edit]
+
+  # --- Database Composition (ADR-0013 §3) ---
+  #
+  # The GRANT Job that runs psql as `postgres` once per grant spec. Crossplane
+  # needs to observe it as well as create it: the Job's readiness (Complete=True)
+  # is what holds the Database XR un-Ready until the IAM user actually has
+  # privileges.
+  - apiGroups: [batch]
+    resources: [jobs]
+    verbs: [get, list, watch, create, update, patch, delete]
+
+  # secrets, configmaps and serviceaccounts are NOT repeated here: core's
+  # `crossplane:system:aggregate-to-crossplane` already grants them (verified
+  # against v2.3.5's clusterrole.yaml above). Aggregation is additive, so
+  # listing them again would be harmless — they are left out so this file
+  # reads as "the gap", and a reader who wonders why a kind is missing can
+  # check core's role and find it there.

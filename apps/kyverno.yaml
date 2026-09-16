@@ -1,0 +1,168 @@
+# Kyverno — sync wave 2 of the root app-of-apps, alongside crossplane-platform.
+#
+# Why Kyverno is here at all (ADR-0014 §3): the XRD schema is the first and
+# cheapest gate, and it says no to anything it can express. Kyverno covers the
+# three things a schema cannot say — "only Crossplane creates raw managed
+# resources in a tenant namespace", "a System gets at most two Databases", and
+# (M3) the metadata spine pre-check. It is VALIDATE-ONLY. No mutating policy
+# exists here, and none should: a mutation rewrites the object after Argo CD
+# applied it, so Argo's next diff sees a cluster that no longer matches git and
+# reports permanent drift. Validate-only keeps `ServerSideDiff` unnecessary and
+# keeps "OutOfSync" meaning what it says.
+#
+# The chart is vendored in this repo (charts/kyverno: upstream 3.9.1, app
+# v1.19.1, unmodified — see charts/README.md), for the same reason the
+# crossplane chart is: the repo-server's only allowed internet egress is git to
+# GitHub (C-23, ADR-0010), and a chart repository would be a second one. Chart
+# 3.9.1 declares five dependencies, three of them from external Helm repos, but
+# all five subcharts ship INSIDE the tarball (charts/kyverno/charts/), and Argo
+# CD renders a directory as-is without running `helm dependency update` — so
+# vendoring the tarball is genuinely self-contained here. Verified 2026-09-16
+# against the extracted 3.9.1 tarball.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: kyverno
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "2"
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/platform-factory/platform-config
+    targetRevision: main
+    path: charts/kyverno
+    helm:
+      releaseName: kyverno
+      valuesObject:
+        global:
+          image:
+            # ADR-0010. Chart 3.9.1's per-image `defaultRegistry` is
+            # reg.kyverno.io, which is NOT one of the five Artifact Registry
+            # remotes layer 0 creates — so without this override every Kyverno
+            # pull would leave the VPC. Every image is also published to
+            # ghcr.io/kyverno/* at the same tag (all seven repositories
+            # verified by anonymous manifest fetch, 2026-09-16), which the
+            # ghcr-io remote already fronts.
+            #
+            # Precedence, read from charts/kyverno/templates/_helpers/_image.tpl
+            # on 2026-09-16:
+            #   per-image .registry > global.image.registry > .defaultRegistry
+            # so this reaches every image whose own `registry` is null — which
+            # is every image that actually runs here. The two that pin
+            # `ghcr.io` themselves are discussed below; neither is ever pulled.
+            registry: us-central1-docker.pkg.dev/platform-factory-ref/ghcr-io
+          # Off by default. On, the admission controller gets list+watch on
+          # CRDs (the chart adds exactly those two verbs to its ClusterRole —
+          # templates/admission-controller/clusterrole.yaml, read 2026-09-16)
+          # and invalidates its discovery cache the moment a CRD appears.
+          #
+          # That matters here specifically: the Database CRD does not exist
+          # when Kyverno installs — Crossplane generates it from the XRD in
+          # wave 3, the same wave as kyverno/policies. Without the watcher,
+          # Kyverno only rediscovers on its resync (global.resyncPeriod, 15m),
+          # so database-claim-budget would sit registered-but-unenforced for
+          # up to fifteen minutes after the XRD lands — long enough for the
+          # first tenant's claim to slip past and long enough to make the
+          # C-07(b) denial evidence unreproducible.
+          crdWatcher: true
+        # Two values keys set `registry: ghcr.io` LITERALLY rather than leaving
+        # it null (charts/kyverno/values.yaml lines 583 and 654), and the
+        # per-image key outranks global.image.registry — so the override above
+        # does not reach `webhooksCleanup` or `test`. Neither is overridden
+        # here, because neither image is ever pulled under Argo CD: every
+        # object that references them is a Helm hook Argo CD does not
+        # implement. See the two notes below.
+        webhooksCleanup:
+          # OFF, and the "off" is the honest position rather than a saving.
+          #
+          # This renders two Jobs annotated `helm.sh/hook: pre-delete` that
+          # remove Kyverno's webhook configurations when the release goes away.
+          # Argo CD never runs them. Verified 2026-09-16 by reading argo-cd
+          # v3.4.6's in-tree gitops-engine: helm/type.go `NewType` accepts only
+          # pre-install, pre-upgrade, post-install and post-upgrade, and
+          # common/types.go's entire hook-type set is PreSync, Sync, PostSync,
+          # Skip, SyncFail — there is no PreDelete at all. A `pre-delete` object
+          # IS still recognised as a hook (helm/hook.go `IsHook` returns true
+          # for any `helm.sh/hook` except crd-install), so sync_phase.go
+          # `syncPhases()` matches no phase, returns an empty phase list, and no
+          # sync task is ever created for it. Argo CD's own docs table
+          # (docs/user-guide/helm.md, the "pre-delete ... Supported as
+          # equivalent to argocd.argoproj.io/hook: PreDelete" row) is stale;
+          # the code is the authority. Leaving the Jobs enabled would render a
+          # safety net that cannot catch anything.
+          #
+          # Turning it off also narrows the admission controller's namespaced
+          # Role: the chart gates `deployments/scale` and patch/update on
+          # deployments behind this flag (templates/admission-controller/
+          # role.yaml lines 49-62), and only the scale-to-zero Job used them.
+          #
+          # WHAT THIS COSTS, AND WHY IT IS A RUNBOOK LINE RATHER THAN A BUG.
+          # Kyverno creates its ValidatingWebhookConfigurations at runtime — the
+          # chart ships none (verified 2026-09-16 by grep over
+          # charts/kyverno/templates/) — so they are not in git and Argo CD will
+          # not prune them. Delete this Application and
+          # `kyverno-resource-validating-webhook-cfg` survives, still carrying
+          # the `validate.kyverno.svc-fail` webhook that
+          # deny-raw-managed-resources registers at failurePolicy: Fail, with no
+          # backend to answer it — which blocks every managed-resource CREATE in
+          # the cluster, Crossplane's own composed resources included. That is
+          # true whether this flag is on or off, because the Jobs never ran
+          # either way. Removing Kyverno is a two-step operation:
+          #
+          #   1. delete this Application
+          #   2. kubectl get validatingwebhookconfiguration,mutatingwebhookconfiguration \
+          #        | grep kyverno
+          #      then delete what it lists — the objects are named
+          #      `kyverno-*-webhook-cfg` (names read from kyverno v1.19.1
+          #      pkg/config/config.go, 2026-09-16).
+          enabled: false
+        # `test` is left alone for the same reason: the chart's test Pods carry
+        # `helm.sh/hook: test` (templates/tests/_helpers.tpl), which Argo CD
+        # does not implement either, so they are never applied and the
+        # ghcr.io-pinned readiness-checker image is never pulled. An override
+        # here would be configuration that does nothing.
+        crds:
+          # Kyverno's CRDs are ordinary templates in two subcharts (crds,
+          # kyverno-api), not Helm's special crds/ directory, so Argo CD
+          # applies them like any other manifest — see the ServerSideApply
+          # note below, which is a consequence of this.
+          install: true
+          migration:
+            # Renders a `helm.sh/hook: post-upgrade` Job (Argo: PostSync) with
+            # hook-delete-policy before-hook-creation, so it would run a
+            # kyverno-cli Job on EVERY sync of this Application. Its purpose is
+            # rewriting stored CRD versions during an upgrade; on a green-field
+            # install there is nothing to migrate. Revisit at the first chart
+            # bump — a future bump that changes a stored version will need this
+            # flipped back on for one sync.
+            enabled: false
+        # Controller resources are left at chart defaults deliberately:
+        # ~400m CPU and 320Mi requested across four Deployments (admission,
+        # background, cleanup, reports), against a 3 x e2-standard-4 node pool.
+        # All four stay enabled. reportsController in particular earns its
+        # keep — PolicyReports are the only place a developer can read WHY
+        # something was flagged, which is exactly the C-07(b) evidence.
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: kyverno
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      # REQUIRED, not a preference. kyverno.io_clusterpolicies.yaml is
+      # 1,424,780 bytes and kyverno.io_policies.yaml 1,424,957 (measured from
+      # the vendored chart, 2026-09-16); client-side apply stores the whole
+      # manifest in the last-applied-configuration annotation, which the API
+      # server caps at 262,144. Four CRD files exceed that outright.
+      - ServerSideApply=true
+    # Backstop, not the ordering mechanism (that's the sync wave). Same
+    # rationale as apps/crossplane.yaml.
+    retry:
+      limit: 10
+      backoff:
+        duration: 15s
+        factor: 2
+        maxDuration: 5m

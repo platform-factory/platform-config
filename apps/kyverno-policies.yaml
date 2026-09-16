@@ -1,0 +1,88 @@
+# Kyverno policies — sync wave 3 of the root app-of-apps.
+#
+# Separate from apps/kyverno.yaml on purpose. The chart (wave 2) installs the
+# `ClusterPolicy` CRD and the webhook machinery; the policies here are
+# instances of that CRD, so they cannot be validated or applied until the chart
+# is Healthy. Splitting them also means a policy change is a small, readable
+# PR that never touches the install.
+#
+# Wave 3 puts these alongside the XRDs and Compositions rather than after them.
+# That is deliberate, and the ordering is genuinely two-sided:
+#
+#   - deny-raw-managed-resources wants to be in force BEFORE the first tenant
+#     namespace exists, so there is no window in which a raw managed resource
+#     could be created in one.
+#   - database-claim-budget matches a kind (`Database`) whose CRD Crossplane
+#     generates from the XRD in this same wave. Kyverno tolerates that: an
+#     unresolvable kind selector simply registers no webhook rule yet, and the
+#     CRD watcher turned on in apps/kyverno.yaml picks the kind up as soon as
+#     it appears. The wave-4 `systems` Application — the first thing that can
+#     produce a Database claim — is what must come after, and it does.
+#
+# The retry block is the backstop for the same race in its harsher form: if
+# this Application syncs while the `ClusterPolicy` CRD is still arriving, the
+# sync fails on the missing CRD and is retried until it is there, rather than
+# leaving the root Degraded until a human looks.
+#
+# WHAT "HEALTHY" MEANS HERE — read this before recording C-07(b) evidence.
+# Argo CD 3.4.6 ships no health check for `kyverno.io/ClusterPolicy`: its
+# resource_customizations/kyverno.io/ directory contains only `Policy`
+# (verified 2026-09-16; the ClusterPolicy path returns 404). With no
+# customization Argo CD falls back to default health for a custom resource and
+# reports Healthy as soon as the object exists. So Healthy on this Application
+# means "the three objects were applied", NOT "the rules are registered on a
+# webhook".
+#
+# Those are genuinely different states, and the gap is the race described
+# above. Kyverno treats an unresolvable kind selector as a WARNING, not an
+# error — pkg/validation/policy/validate.go `validKinds` returns
+# ("unable to convert GVK to GVR for kinds %s", nil) when discovery yields no
+# GVR, and the caller appends it as a warning and returns nil (read at v1.19.1,
+# 2026-09-16). So database-claim-budget is admitted, shows Healthy, and opens
+# the wave 3 -> wave 4 gate while enforcing nothing until the `Database` CRD
+# reaches Kyverno's discovery cache. `global.crdWatcher: true` in
+# apps/kyverno.yaml shrinks that window from one resync (15m) to seconds, but
+# it does not make the Healthy signal mean more than it does.
+#
+# No health customization is added for this kind in M2 on purpose: Argo's
+# `Policy` Lua requires a condition spelled exactly
+# type=Ready/status=True/reason=Succeeded/message=Ready, and if a ClusterPolicy
+# does not publish that exact shape the Application would sit Progressing and
+# block wave 4 — trading a signal that is merely weak for one that can wedge
+# the sync. The check a human runs before recording C-07(b) evidence is
+# `kubectl get cpol` (READY column) and
+# `kubectl get validatingwebhookconfiguration kyverno-resource-validating-webhook-cfg -o yaml`,
+# to see the rules actually registered.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: kyverno-policies
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "3"
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/platform-factory/platform-config
+    targetRevision: main
+    path: kyverno/policies
+  destination:
+    server: https://kubernetes.default.svc
+    # ClusterPolicies and the ClusterRole here are cluster-scoped; Argo CD
+    # still requires a destination namespace, and this one exists by wave 2.
+    namespace: kyverno
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      # Same reason as everywhere else in this repo: a ClusterPolicy carries
+      # the rule bodies inline and client-side apply would push them into the
+      # last-applied-configuration annotation.
+      - ServerSideApply=true
+    retry:
+      limit: 10
+      backoff:
+        duration: 15s
+        factor: 2
+        maxDuration: 5m
