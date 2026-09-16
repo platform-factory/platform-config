@@ -56,6 +56,10 @@ spec:
     failurePolicy: Ignore
   rules:
     - name: at-most-two-databases-per-namespace
+      # Explicit for the same reason as in deny-raw-managed-resources.yaml:
+      # Kyverno defaults these and Argo CD reads absent list-item fields as
+      # drift.
+      skipBackgroundRequests: true
       match:
         any:
           - resources:
@@ -72,6 +76,7 @@ spec:
       context:
         - name: databasecount
           apiCall:
+            method: GET
             # "items | length(@)" is the documented counting idiom — it is the
             # example in the CRD's own description of this field (read from the
             # vendored kyverno.io_clusterpolicies.yaml, 2026-09-16).
@@ -87,6 +92,7 @@ spec:
             default: 0
       validate:
         failureAction: Enforce
+        allowExistingViolations: true
         message: >-
           This system already has {{ databasecount }} Database claims, and the
           limit is two. A Cloud SQL instance outlives the claim that created it
