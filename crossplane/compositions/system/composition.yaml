@@ -102,14 +102,15 @@
 #     names at write time. Nothing fails.
 #
 #   - Google Cloud side: NOT VERIFIED, and this is the one load-bearing claim
-#     in this file with no dated primary source behind it. Five resources here
-#     name `group:<team>@<orgDomain>` in an IAM binding — four ProjectIAMMembers
-#     and one RegistryRepositoryIAMMember. Searched 2026-09-16 for a Google
+#     in this file with no dated primary source behind it. Three resources here
+#     name `group:<team>@<orgDomain>` in an IAM binding — two ProjectIAMMembers
+#     and one RegistryRepositoryIAMMember (the other two ProjectIAMMembers name
+#     the System's service account, not the group). Searched 2026-09-16 for a Google
 #     statement on whether setIamPolicy accepts a principal email that does not
 #     resolve to a Workspace identity (cloud.google.com/iam/docs:
 #     principal-identifiers, granting-changing-revoking-access, policies,
 #     resource-manager setIamPolicy reference) and found no sentence either
-#     way. If IAM rejects the binding, those five managed resources sit
+#     way. If IAM rejects the binding, those three managed resources sit
 #     not-Ready, the System XR sits Ready=False with them named in the message,
 #     and the `systems` Application stays Progressing — which would stop C-05's
 #     stopwatch for a reason nothing in the cluster explains.
