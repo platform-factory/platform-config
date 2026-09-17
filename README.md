@@ -683,9 +683,11 @@ waiting**.
   and `_Database` work. [C]
 - **Both an XRD schema denial and a Kyverno denial reach the developer with a
   readable message** — at the API server (`kubectl apply`) and at the offline
-  CLI (`crossplane resource validate`), which are the two surfaces that were
-  exercised. [C] The Argo CD surface — a bad claim merged to `main` — is
-  **NOT YET RUN**.
+  CLI (`crossplane resource validate`) on 2026-09-16, and through Argo CD on
+  2026-09-17 for the wrong-region claim: the Application goes `OutOfSync`
+  (still `Healthy`), the claim shows `SyncFailed` with the schema's own
+  message, and the sync retries. [C] The oversized and CEL claims, and the
+  Kyverno denial, were not run through Argo CD.
 - **One file is one tenant.** The second tenant (`svc-ledger`) went from merge
   at 17:02:13 to `System` Ready at 17:06:21 — 4m08s, most of it Argo CD's
   ~3-minute repo poll — and to a Running pod in its own namespace by roughly
@@ -720,7 +722,7 @@ selector as **VERIFIED**, by reading Kyverno's source. Reading the source told
 them how Kyverno evaluates a policy; it did not tell them what Kyverno writes
 into the webhook.
 
-### Open in this repo at the end of 2026-09-16
+### Where the 2026-09-16 open items stood after the second test day (2026-09-17)
 
 - **Three stuck IAM members from C-06's first run.** The three original team
   IAM members — two `ProjectIAMMember`s and one
@@ -729,17 +731,34 @@ into the webhook.
   DELETING since 17:23:33 with `delete failed … Create IAM Members
   group:checkout@… for project ""` — the refused in-place update had already
   rewritten their spec, so the delete path now runs with an empty project.
-  Cloud still grants `payments` the two Cloud SQL roles and registry writer.
-  Clearing this needs manual cleanup (remove finalizers, then `gcloud …
-  remove-iam-policy-binding`), and **one clean re-run of the move under the
-  fixed Composition — NOT YET DONE.**
-- **C-07(c) — delete the claim, the database survives — NOT YET RUN.** Deletion
-  protection was exercised by accident instead: the hand-applied raw instance
+  **Resolved 2026-09-17, with a new finding.** The three objects finished
+  deleting on their own overnight — and, because the refused update had
+  rewritten their spec to `checkout`, what they deleted was the *checkout*
+  grants, while every `-checkout` member object still said Ready. That is the
+  **shared-grant hazard**: a project-level IAM binding is identified by role
+  and member, so two Systems owned by one team compose two objects for one
+  cloud grant, and deleting either removes it for both until the provider's
+  next poll puts it back (about five minutes, measured). The clean re-run
+  under the fixed Composition then ran as predicted — one file, three members
+  re-created, 1m55s from merge, no stuck objects — and reproduced the hazard on
+  demand. The fix is decided in the design seed's ADR-0016 §2 (a per-System
+  IAM Condition on the Cloud SQL grants) and **is not built yet**.
+- **C-07(c) — delete the claim, the database survives — run 2026-09-17, and it
+  held.** The claim was pruned and every composed object left the namespace;
+  the Cloud SQL instance, its database, its IAM user and its data stayed, and
+  the application kept serving. Restoring the claim adopted the same instance
+  in 66 seconds (a fresh one took about fourteen minutes), creation time
+  unchanged. Deletion protection had been exercised by accident the day
+  before: the hand-applied raw instance
   carried both protection flags, and removing it needed the object's
   `deletionProtection` patched to false *and* `gcloud sql instances patch
   --no-deletion-protection`. Both locks held until deliberately removed.
-- **The Argo CD denial surface — a bad claim merged to `main` — NOT YET RUN.**
-  The API-server and offline-CLI surfaces are both recorded.
+- **The Argo CD denial surface — run 2026-09-17** for the wrong-region claim
+  (see above); the rest of that matrix was not run.
+- **A clean rebuild from parked — run 2026-09-17:** `down`, `park`, `up` with
+  zero manual steps, 35m31s up, and the adoption check recorded the instance
+  and both registries as adopted, none re-created. Crossplane restarted the
+  parked instance by itself about twenty seconds after the claim synced.
 - **The `sql User` provider bug (#1000) is open upstream**, so every new
   database still costs one manual `gcloud sql users create`.
 
