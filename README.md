@@ -163,7 +163,7 @@ metadata:
   name: svc-hello          # = namespace = AppProject = registry repo = GCP service account
 spec:
   owner:
-    team: payments         # = payments@thecloudgeek.io, by convention
+    team: checkout         # = checkout@thecloudgeek.io, by convention
     repo: platform-factory/svc-hello
   tier: standard
   securityTier: internal
@@ -184,13 +184,27 @@ From those five fields the Composition builds sixteen objects in three places:
 | `argocd` | `AppProject`, `Application` | the tenant may sync its own repo's `k8s/` directory, into its own namespace, and nothing else |
 | Google Cloud | a service account, a Workload Identity binding, four project IAM members, an Artifact Registry repository, and a repository IAM member | the System's identity, its database access, and somewhere to push images |
 
-Four things are worth knowing before reading the Composition.
+Seven things are worth knowing before reading the Composition.
 
 **A System is Cluster-scoped, and that is not cosmetic.** A cluster-scoped XR
 may compose namespaced objects in *any* namespace; a namespaced one is confined
 to its own. That is the only reason a single recipe can put an `AppProject` into
 `argocd` and a `RoleBinding` into the tenant's namespace. It is also honest: a
 System *creates* the namespace, so it cannot live inside one.
+
+**The Composition emits the `Namespace` first and everything else on the next
+pass, and that ordering gate is not optional.** Crossplane applies composed
+resources in map order and stops at the *first* apply error. Everything below
+the `Namespace` either lives in it or grants on it, so on the very first System
+(live, 2026-09-16) every reconcile died on a different namespaced object —
+`namespaces svc-hello not found`, first on `gsa`, then on `registry-writer` —
+until the `Namespace` happened to be applied first. The template now renders
+only the `Namespace` until it observes it, and renders the rest on the
+reconcile that observation triggers: **two deterministic passes instead of N
+probabilistic ones.** `crossplane render` shows 2 objects before the namespace
+is observed and 17 after — the XR itself plus the sixteen above. It is the same shape the Database Composition uses to
+hold back its `GRANT` Job. The second tenant, onboarded after the fix, composed
+with no ordering error at all.
 
 **The team is a field, and it binds in six places, not four.** ADR-0012 §4
 lists four: the `RoleBinding` subjects (there are two bindings, see below), the
@@ -207,6 +221,30 @@ is three entries — the three IAM members, because changing `member` on an
 `IdentifierFromProvider` resource is a replacement rather than an update — and
 everything else updates in place. That prediction is written into the
 Composition's header, before the run.
+
+**Measured live on 2026-09-16, and the prediction was right about *which*
+three and wrong about *how*.** The three IAM members kept their object names,
+so upjet — the code generator that wraps the Terraform GCP provider as a
+Crossplane provider, which is what `provider-upjet-gcp` is — was asked to change
+`member` in place, and refused: `async update
+failed: refuse to update the external resource because the following update
+requires replacing it`. upjet does not perform replacements, and a managed
+resource's `Ready` condition is not re-evaluated by a failed update, so each of
+the three stayed `Ready=True` from its original creation while only `Synced`
+went False. The `System` reported `Ready=True` throughout with the cloud
+grants still naming the old team: **the platform exposed no signal that
+anything had failed.** The fix (PR #6) puts the team into the object *name* and
+composition-resource-name of those three, so a move composes three new members
+and Crossplane garbage-collects the three old ones. "Re-created" is now literal
+and the count is still three. What that fix does not do is repair the three
+members that were already mid-failure — see **Status**.
+
+One signal against that design showed up in the same run: Crossplane's watch
+circuit breaker opened on the project IAM members (`Too many watch events from
+ProjectIAMMember … Allowing events periodically`, `Responsive=False`). It was
+transient and self-healed, but the fix above makes IAM-member churn larger, not
+smaller — every team move now composes three new objects and garbage-collects
+three old ones.
 
 **The team gets two ClusterRoles, and the second one is the surprising part.**
 Crossplane aggregates managed-resource and composite kinds into its own
@@ -246,13 +284,22 @@ prerequisite rather than a graceful degradation: the Google Group
 `<team>@thecloudgeek.io` must exist and be nested under
 `gke-security-groups@thecloudgeek.io` before the first `System` syncs. Creating
 groups is a Workspace-admin task (ADR-0012 §3). The Kubernetes half is settled —
-a `RoleBinding` naming a group nobody belongs to is accepted and inert. The
-Google Cloud half is **not verified**: five composed resources put
-`group:<team>@thecloudgeek.io` into an IAM binding, and a search of Google's IAM
-documentation on 2026-09-16 found no statement on whether `setIamPolicy` accepts
-a principal email that does not resolve. If it rejects, those resources sit
-not-Ready and the `System` never reports Ready. The first cycle settles it in
-one observation.
+a `RoleBinding` naming a group nobody belongs to is accepted and inert.
+
+The Google Cloud half was exercised on 2026-09-16 **with the groups already
+created**, which is the supported order and also the reason the interesting
+question is still open. With `payments@` and `checkout@` existing and nested
+under `gke-security-groups@`, the per-System Google service account and all
+four `ProjectIAMMember`s — including the two naming
+`group:<team>@thecloudgeek.io` — reported `Synced=True` on the first reconcile
+[C]. (The Composition's own header still says *five* resources name the group:
+it counts all four `ProjectIAMMember`s, where in fact only the two `team` ones
+carry the group principal and the other two name the service account.
+Correcting that header is follow-up work.) So the happy path is confirmed. What is still **not verified** is the
+failure path: nothing in the run asked `setIamPolicy` to accept a principal
+email that does not resolve, so "the group is a hard prerequisite" remains the
+instruction rather than a measured consequence. Do not read the green first
+cycle as having settled it.
 
 `crossplane/compositions/system/example.yaml` is the same tenant as a
 standalone file for `crossplane render`. It is **excluded from the sync** by
@@ -299,6 +346,41 @@ The application's pod runs the Cloud SQL Auth Proxy as a sidecar with
 the app a plaintext socket on `127.0.0.1:5432`. The token expires in an hour,
 so "managed rotation" is delivered by construction rather than by a rotation
 job.
+
+That path was proven end to end on 2026-09-16 — a probe pod wrote a row and
+read it back through an identity that was never handed a password, with no
+Secret mounted in the application pod [C] — but it does **not** come up on its
+own today, and the reason is a provider bug.
+
+**provider-upjet-gcp v3.0.0 cannot create a passwordless `sql User`
+(crossplane-contrib/provider-upjet-gcp issue #1000, open).** The managed
+resource fails with `async create failed: recovered from panic: not a string`.
+A maintainer root-caused it on 2026-09-14: v3.0.0 strips `password_wo` from the
+runtime schema, so *every* passwordless `sql.User` create panics — and a
+`CLOUD_IAM_SERVICE_ACCOUNT` user is by definition passwordless. This
+Composition's whole credential story depends on exactly that kind. There is no
+Composition-side workaround: supplying a password instead was probed and Cloud
+SQL answers `HTTPError 400: Invalid request: Cloud IAM password cannot be set
+in the database.` Until a fixed provider ships, **every new database costs one
+manual command**, run out of band so that the provider's `Observe` path adopts
+the user it did not create:
+
+```
+gcloud sql users create <system>@<project>.iam \
+  --instance=<system>-<claim> --type=CLOUD_IAM_SERVICE_ACCOUNT
+```
+
+On the first run that was
+`gcloud sql users create svc-hello@platform-factory-ref.iam --instance=svc-hello-main --type=CLOUD_IAM_SERVICE_ACCOUNT`
+at 17:10:44; the user was adopted `Ready` 38 seconds later, the `GRANT` Job ran
+17:11:22→17:11:42, and the application pod went Ready at 17:11:51. Before the
+user existed the app log read `FATAL: password authentication failed for user
+"svc-hello@platform-factory-ref.iam"`, which is the symptom to recognise. The
+managed resource sat failing from 17:08:17 to 17:10:44 — that whole window is
+the managed resource sitting failed while waiting for a human to run that
+command, and it is counted as a manual intervention against
+C-02 and C-07(a). A provider version bump is precisely the change class M4 is
+built around.
 
 **One password still exists, and it is honest about why.** Cloud SQL creates
 an IAM database user with no privileges on anything, and only a privileged
@@ -355,16 +437,30 @@ external name is deterministic (`<system>-<claim>`), which is the entire
 mechanism by which a cluster rebuild *adopts* the existing instance instead of
 creating a second empty one.
 
-**Two things a reader should not mistake for oversights.**
+**Three things a reader should not mistake for oversights.** The first two are
+known deferrals, named here rather than discovered later.
 
-- **No `CLOUD_IAM_GROUP` user.** ADR-0013 §5 gives humans the same IAM door as
-  the application, via a Cloud SQL user for the owning team's group. It is
-  deferred *within* M2 and the Composition's header says so at the top. The
-  reason is scope, not capability: the team label lives on the namespace, and
-  a Composition can read a resource it did not compose, so the lookup is about
-  eight lines plus one RBAC rule. Until it lands, a human uses the break-glass
-  Secret — which is exactly the shared credential ADR-0013 set out to remove,
-  and therefore worth closing.
+- **No `CLOUD_IAM_GROUP` user — human access is deferred within M2.** ADR-0013
+  §5 gives humans the same IAM door as the application, via a Cloud SQL user
+  for the owning team's group. It is deferred *within* M2 and the
+  Composition's header says so at the top. The reason is scope, not
+  capability: the team label lives on the namespace, and a Composition can read
+  a resource it did not compose, so the lookup is about eight lines plus one
+  RBAC rule. Until it lands, a human uses the break-glass Secret — which is
+  exactly the shared credential ADR-0013 set out to remove, and therefore worth
+  closing. Nothing in the 2026-09-16 run changed this; it was not built.
+- **The break-glass password is wrong after a cluster rebuild, and that gap is
+  known.** The `<claim>-admin` Secret dies with the cluster, the Composition
+  mints a new random password, and the provider only ever sends `root_password`
+  at instance create — so from cycle 2 on, the Secret and the real `postgres`
+  password disagree. The golden path is unaffected (the `GRANT` Job asks the
+  application's IAM identity first and only spends the password when the grant
+  is genuinely missing), so C-02's zero-intervention bar is not at risk. What
+  is broken is the break-glass path itself, and recovery is one human command,
+  `gcloud sql users set-password postgres --instance=<instance>`. The real fix
+  is a seed held in `platform-bootstrap` layer 3, whose Terraform state
+  outlives the cluster; the Composition's header carries the code references
+  and the reasoning. Not built in M2.
 - **`edition: ENTERPRISE` is load-bearing.** The Cloud SQL API defaults
   PostgreSQL 16+ to `ENTERPRISE_PLUS`, which accepts only `db-perf-optimized-*`
   machine types. Every size class here is shared-core or custom, so omitting
@@ -388,6 +484,14 @@ fields. A claim asking for `region: eu-west1` is told which regions exist; a
 claim asking for `size: L` without `tier: critical` gets the rule's own
 sentence; a claim inventing `machineType:` is told the field does not exist.
 
+Run for real on 2026-09-16 with `crossplane` v2.5.0, offline, against the three
+deliberately-bad claims kept in `svc-hello/docs/c07-denials/`: `Total 3
+resources: 0 missing schemas, 0 success cases, 3 failure cases`, and the three
+messages are the same sentences the API server prints, prefixed `[x] schema
+validation error …` and `[x] CEL validation error …` [C]. The gate really is
+the same gate offline and at admission, which is the whole of ADR-0014's "the
+schema denies first".
+
 ## Kyverno
 
 Kyverno arrives in M2 as `apps/kyverno.yaml` (wave 2, the vendored chart in
@@ -397,8 +501,25 @@ Kyverno arrives in M2 as `apps/kyverno.yaml` (wave 2, the vendored chart in
 **It is validate-only, and that is a decision, not a starting point.** No
 mutating policy exists here and none should: a mutation rewrites an object
 after Argo CD applied it, so Argo's next diff sees a cluster that no longer
-matches git and reports drift forever. Validate-only keeps "OutOfSync"
-meaning what it says and keeps `ServerSideDiff` unnecessary (ADR-0014).
+matches git and reports drift forever. Validate-only keeps "OutOfSync" meaning
+what it says (ADR-0014).
+
+What validate-only did **not** buy is freedom from `ServerSideDiff`, and that
+sentence used to be in this README. On the first bring-up (2026-09-16) both
+Kyverno Applications sat permanently `OutOfSync` with nothing actually
+different, for three separate reasons, none of them a mutation: Kyverno
+defaults the deprecated spec-level `validationFailureAction` to `Audit` and
+shows it in `kubectl get clusterpolicy` next to rules that say `Enforce`; it
+defaults `skipBackgroundRequests`, `allowExistingViolations` and
+`apiCall.method` *inside* `rules[]`, where even `ServerSideDiff` cannot
+attribute a default to the API server; and the chart renders empty
+`labels: {}` / `annotations: {}` maps on its CRDs, which the API server drops.
+That is not cosmetic — `cycle.sh` gates a rebuild on *every* Application being
+Synced, so permanent drift here would fail every future C-02 cycle. The fix is
+all three at once: the spec-level `validationFailureAction` stated explicitly
+(PR #4), `ServerSideDiff=true` on both Applications (PR #5), and the defaulted
+rule fields written out with two CRD pointers ignored (PR #7). Verify
+then passed with 111 seconds to spare.
 
 **It is also the last gate, not the first.** ADR-0014's order is: the XRD
 schema says no to everything it can express — `enum`, `pattern`, CEL — because
@@ -410,6 +531,37 @@ cannot say, one per file:
 |---|---|
 | `deny-raw-managed-resources` | "only Crossplane creates these" — a rule about *who is asking*, not about the object |
 | `database-claim-budget` | "at most two per namespace" — a rule about *the other objects*, not this one |
+
+**`deny-raw-managed-resources` enumerates the provider API groups, one line
+per installed provider, and a wildcard group cannot replace that list.** This
+is the single most expensive thing the live run found, and it is worth
+understanding the mechanism rather than the rule. A Kyverno kind selector is
+written `group/version/kind`, and Kyverno *does* wildcard-match the group
+segment when it evaluates a policy — but before any of that, Kyverno has to
+register a `ValidatingWebhookConfiguration` with the API server, and it writes
+the group segment into that webhook's `apiGroups` **verbatim**. The API server
+does not glob `apiGroups`; only a lone `*` is special there. So
+`*.gcp.m.upbound.io/*/*` registered the literal string `*.gcp.m.upbound.io`,
+matched nothing at all, and the policy was never consulted: a raw
+`DatabaseInstance` applied by hand in a tenant namespace on 2026-09-16 was
+**admitted, and created a real Cloud SQL instance**. A concrete group with
+wildcard version and kind (`sql.gcp.m.upbound.io/*/*`) *is* expanded properly —
+probed live, `groups=[sql.gcp.m.upbound.io] versions=[*] resources=[*]`. So
+both rules now list the five installed provider groups explicitly, one per
+provider package in `crossplane/providers/` that serves managed resources —
+the family provider's own config group `gcp.m.upbound.io` is deliberately not
+matched — for both the namespaced
+(`*.gcp.m.upbound.io`) and legacy cluster-scoped (`*.gcp.upbound.io`)
+families — ten concrete groups on the webhook. After the fix the same hand-run
+test is denied with the policy's own sentence, and Crossplane's composed
+resources still pass, which the second tenant demonstrated by composing
+cleanly afterwards. [C] 2026-09-16
+
+**Adding a provider now means adding a line to those two lists.** That is the
+coupling the wildcard was meant to avoid, kept explicit instead of silently
+absent. It also changes the migration note further down: the enumeration that
+`kyverno/policies/deny-raw-managed-resources.yaml` treats as the cost of moving
+to `ValidatingPolicy` has already been paid here.
 
 `database-claim-budget` counts existing claims through an `apiCall`, which
 needs a read grant Kyverno does not ship with; `database-claim-budget-rbac.yaml`
@@ -441,12 +593,15 @@ Two more things a reader should not have to discover the hard way. **Healthy
 is a weak signal here:** Argo CD 3.4.6 ships no health check for
 `kyverno.io/ClusterPolicy`, so the wave-3 Application reports Healthy once the
 objects exist, not once their rules are registered on a webhook — `kubectl get
-cpol` is the check to run before trusting a denial test. And both policies use
-`kyverno.io/v1 ClusterPolicy`, a group upstream has marked deprecated; the
-successor `ValidatingPolicy` cannot express either rule today (no
-partial-wildcard API groups, no `apiCall` context), and the migration trigger
-is recorded in `kyverno/policies/deny-raw-managed-resources.yaml` and
-`charts/README.md`.
+cpol` is the check to run before trusting a denial test — and on 2026-09-16
+that was not a hypothetical: the wave-3 Application was Healthy for the whole
+window in which the reality gate matched nothing. And both policies use
+`kyverno.io/v1 ClusterPolicy`, a group upstream has marked deprecated. The
+remaining blocker on the successor `ValidatingPolicy` is `database-claim-budget`'s
+`apiCall` context, which it has no equivalent for; the "partial-wildcard API
+groups" half of that argument died with the finding above, because the
+enumeration is now written out here anyway. The migration trigger is recorded
+in `kyverno/policies/deny-raw-managed-resources.yaml` and `charts/README.md`.
 
 ## Adding a component
 
@@ -464,14 +619,17 @@ External Secrets Operator, external-dns, and the Gateway are M3 work.
 The `CLOUD_IAM_GROUP` database user — the path by which a human on the owning
 team logs into Cloud SQL with their own identity rather than the break-glass
 admin password — is deferred within M2 and is documented in the header of
-`crossplane/compositions/database/composition.yaml`.
+`crossplane/compositions/database/composition.yaml`. The break-glass password
+itself goes stale on every cluster rebuild, and the durable seed that would fix
+it belongs in `platform-bootstrap` layer 3; neither is built.
 
-Everything else this section used to list is now written here: the two XRDs and
-Compositions, the `System` API, Kyverno, and the `ClusterProviderConfig` that
-gives the providers their GCP identity. Written, not yet run — see **Status**
-at the bottom. Once synced, this repo does create cloud resources: a `System`
-composes an Artifact Registry repository, a service account and its IAM grants,
-and a `Database` composes a Cloud SQL instance.
+Everything else this section used to list is now written here *and has run*:
+the two XRDs and Compositions, the `System` API, Kyverno, and the
+`ClusterProviderConfig` that gives the providers their GCP identity. This repo
+creates real cloud resources — a `System` composes an Artifact Registry
+repository, a service account and its IAM grants; a `Database` composes a Cloud
+SQL instance — and as of 2026-09-16 it has done so. See **Status** for what the
+first run proved and what it broke.
 
 ## Part of the Platform Factory
 
@@ -483,37 +641,126 @@ This repo is built out in **M1** and extended in **M2**.
 
 ## Status
 
-**Status:** M2 — authored, not yet synced to a cluster.
+**Status:** M2 — synced and first exercised on 2026-09-16.
 
 M1 landed the spine and has been exercised: Crossplane core plus the GCP
 provider family, ordered by sync waves, images and packages routed through
-Artifact Registry. Three scripted cycles ran at zero interventions (C-02/C-04,
-recorded in the design seed's `docs/build-log/m1-spine.md`).
+Artifact Registry. Three scripted cycles ran, two of them at zero interventions; cycle 1 needed
+one (C-02/C-04, recorded in the design seed's `docs/build-log/m1-spine.md`).
 
-M2 adds the paved road on top, and **none of it has run against a cluster
-yet.** Every file below is written and internally consistent; the first sync is
-what turns that into evidence:
+M2's paved road reached a cluster for the first time on **2026-09-16**, on
+`cycle.sh` cycle 4 `up`. The app-of-apps converged to **10/10 Applications
+Synced/Healthy** — the seven files in `apps/`, the root, and the two tenant
+`Application`s the System Composition composes — after 2289 seconds of verify,
+against a 2400-second deadline.
 
-- `crossplane/platform/` — the `ClusterProviderConfig` that finally gives the
-  providers a GCP identity, the `EnvironmentConfig`, the three composition
-  functions, and Crossplane's aggregated `ClusterRole`.
-- `crossplane/compositions/` — the `System` and `Database` XRDs and
-  Compositions: the whole developer-facing API surface.
-- `charts/kyverno/` + `kyverno/policies/` — the two validate-only
-  `ClusterPolicies` and the read grant one of them needs.
-- `apps/systems.yaml` — wave 4, pointing at the `systems` repo, whose first
-  tenant file is `tenants/svc-hello.yaml`.
+**That run was a bring-up, not a measured C-02 cycle**, and this README says so
+rather than quoting the total as a rebuild time. Four kinds of intervention
+happened inside it: the planned one-time `svc-hello` image push, one out-of-band
+`gcloud sql users create` (the provider bug above), a hard refresh of two
+Applications, and **five fix PRs merged into this repo while verify was still
+waiting**.
 
-Three things outside this repo have to be true before the first sync means
-anything, and each is a named manual step rather than something the platform
-hides: `platform-bootstrap`'s M2 layer-0 and layer-1 applies (the provider
-Google service account, the new APIs, and Private Services Access), the Google
-Workspace groups (`gke-security-groups@` with the team groups nested inside),
-and one hand-push of the `svc-hello` image. The consolidated order lives in
-`platform-bootstrap`'s README.
+### What the first run proved
 
-The first live run is C-02 cycle 4 — the first rebuild with a tenant, a
-database and durable cloud resources on the other side of it — and it doubles
-as C-05 (merge-to-usable for a second tenant), C-07(a) (merge-to-usable for a
-database) and C-07(c) (the rebuild adopts rather than re-creates). Results land
-in the design seed repo's `docs/build-log/m2-paved-road.md`.
+- **The provider identity path works.** The per-System Google service account
+  and all four `ProjectIAMMember`s reported `Synced=True` on the first
+  reconcile: Google service account + Workload Identity binding +
+  `DeploymentRuntimeConfig`-pinned Kubernetes service account +
+  `ClusterProviderConfig`
+  `credentials.source: InjectedIdentity`, with namespaced managed resources
+  defaulting to `ClusterProviderConfig/default` and no per-namespace object to
+  compose. [C] 2026-09-16
+- **The sync waves hold with the paved road on top of them:** crossplane (0) →
+  providers (1 — Degraded once, recovered by the retry backstop, same as M1) →
+  crossplane-platform and kyverno (2) → compositions and kyverno-policies (3) →
+  systems (4) → the tenant Applications the System composes.
+- **Crossplane 2.3.5 composes native Kubernetes objects directly** —
+  `Namespace`, `ResourceQuota`, `RoleBinding`, `ServiceAccount`, `ConfigMap`,
+  `Secret`, `Job`, Argo `AppProject` and `Application` — given the aggregated
+  `ClusterRole` with `bind` on the bound roles. No `provider-kubernetes`. [C]
+- **Argo CD 3.4.6 per-kind health keys** for `platform.thecloudgeek.io_System`
+  and `_Database` work. [C]
+- **Both an XRD schema denial and a Kyverno denial reach the developer with a
+  readable message** — at the API server (`kubectl apply`) and at the offline
+  CLI (`crossplane resource validate`) on 2026-09-16, and through Argo CD on
+  2026-09-17 for the wrong-region claim: the Application goes `OutOfSync`
+  (still `Healthy`), the claim shows `SyncFailed` with the schema's own
+  message, and the sync retries. [C] The oversized and CEL claims, and the
+  Kyverno denial, were not run through Argo CD.
+- **One file is one tenant.** The second tenant (`svc-ledger`) went from merge
+  at 17:02:13 to `System` Ready at 17:06:21 — 4m08s, most of it Argo CD's
+  ~3-minute repo poll — and to a Running pod in its own namespace by roughly
+  17:07. That pod is a placeholder unprivileged nginx pulled through the
+  Docker Hub remote: `svc-ledger` exists to test onboarding rather than to run
+  anything, so what was measured is a tenant reaching the point where a
+  workload runs, not a second real service shipping.
+- **A database the application logs into with no password**, proven from a
+  probe pod at 17:13:28 with no Secret mounted in the app pod — at the cost of
+  one manual command per database, for now.
+
+### The five fix PRs the live run forced
+
+Every one of these was found by running the thing, not by reading it. Review
+had already closed 84 findings before anything touched the cloud, 13 of them
+blockers. The live run found eight further defects review had not; the five
+below are the ones that landed as PRs in this repo — the other three are in
+`svc-hello` (the Dockerfile cross-build), `platform-bootstrap`'s layer plans
+(a plan generated before the layer below it was applied) and `cycle.sh` (the
+`gcloud` `createTime` local-time rewrite).
+
+| PR | Merged | What it changed | Why the run forced it |
+|---|---|---|---|
+| #3 | ~16:58 | System Composition: emit only the `Namespace` until it is observed | Crossplane applies composed resources in map order and stops at the first error, so a new System died on a different namespaced object every reconcile |
+| #4 | 17:01:24 | Kyverno: enumerate the installed provider groups; state `Enforce` at the spec level too | A wildcard group is written verbatim into the webhook's `apiGroups`, which the API server does not glob — the reality gate matched nothing, and a hand-applied raw `DatabaseInstance` created a real Cloud SQL instance |
+| #5 | ~17:07 | `ServerSideDiff=true` on both Kyverno Applications | API-server-defaulted CRD fields read as permanent drift; `cycle.sh` gates a rebuild on every Application being Synced |
+| #6 | 17:18:30 | System Composition: the three team-bearing IAM members carry the team in their names | upjet refuses an update that requires a replacement, so a team move left the cloud grants naming the old team while the System still reported Ready |
+| #7 | ~17:24 | Kyverno: state the defaulted fields inside `rules[]`; ignore the chart's empty CRD label/annotation maps | `ServerSideDiff` cannot attribute a default inside a list item, and the API server drops empty maps |
+
+PR #4 is the one worth remembering: the adversarial reviewers had recorded that
+selector as **VERIFIED**, by reading Kyverno's source. Reading the source told
+them how Kyverno evaluates a policy; it did not tell them what Kyverno writes
+into the webhook.
+
+### Where the 2026-09-16 open items stood after the second test day (2026-09-17)
+
+- **Three stuck IAM members from C-06's first run.** The three original team
+  IAM members — two `ProjectIAMMember`s and one
+  `RegistryRepositoryIAMMember`, composed before PR #6 and so with no team in
+  their object names — have been
+  DELETING since 17:23:33 with `delete failed … Create IAM Members
+  group:checkout@… for project ""` — the refused in-place update had already
+  rewritten their spec, so the delete path now runs with an empty project.
+  **Resolved 2026-09-17, with a new finding.** The three objects finished
+  deleting on their own overnight — and, because the refused update had
+  rewritten their spec to `checkout`, what they deleted was the *checkout*
+  grants, while every `-checkout` member object still said Ready. That is the
+  **shared-grant hazard**: a project-level IAM binding is identified by role
+  and member, so two Systems owned by one team compose two objects for one
+  cloud grant, and deleting either removes it for both until the provider's
+  next poll puts it back (about five minutes, measured). The clean re-run
+  under the fixed Composition then ran as predicted — one file, three members
+  re-created, 1m55s from merge, no stuck objects — and reproduced the hazard on
+  demand. The fix is decided in the design seed's ADR-0016 §2 (a per-System
+  IAM Condition on the Cloud SQL grants) and **is not built yet**.
+- **C-07(c) — delete the claim, the database survives — run 2026-09-17, and it
+  held.** The claim was pruned and every composed object left the namespace;
+  the Cloud SQL instance, its database, its IAM user and its data stayed, and
+  the application kept serving. Restoring the claim adopted the same instance
+  in 66 seconds (a fresh one took about fourteen minutes), creation time
+  unchanged. Deletion protection had been exercised by accident the day
+  before: the hand-applied raw instance
+  carried both protection flags, and removing it needed the object's
+  `deletionProtection` patched to false *and* `gcloud sql instances patch
+  --no-deletion-protection`. Both locks held until deliberately removed.
+- **The Argo CD denial surface — run 2026-09-17** for the wrong-region claim
+  (see above); the rest of that matrix was not run.
+- **A clean rebuild from parked — run 2026-09-17:** `down`, `park`, `up` with
+  zero manual steps, 35m31s up, and the adoption check recorded the instance
+  and both registries as adopted, none re-created. Crossplane restarted the
+  parked instance by itself about twenty seconds after the claim synced.
+- **The `sql User` provider bug (#1000) is open upstream**, so every new
+  database still costs one manual `gcloud sql users create`.
+
+Results and grades land in the design seed repo's
+`docs/build-log/m2-paved-road.md`.

@@ -36,10 +36,17 @@
 # There is no `*.gcp.m.upbound.io` form. Writing this as a ValidatingPolicy
 # would mean either enumerating every provider group by hand and re-editing on
 # every new provider, or registering `apiGroups: ["*"]` — a webhook on every
-# resource in the cluster — and filtering in CEL. ClusterPolicy's kind selector
-# wildcard-matches the group segment and is then resolved through discovery to
-# concrete GVRs, which is exactly the shape this rule needs (see the match block
-# below). The same group deprecation applies to database-claim-budget.yaml.
+# resource in the cluster — and filtering in CEL.
+#
+# CORRECTED 2026-09-16 BY THE LIVE RUN: this header originally went on to say
+# that ClusterPolicy's kind selector wildcard-matches the GROUP segment and
+# resolves it through discovery to concrete GVRs. It does not. A wildcard group
+# was written verbatim into the webhook and matched nothing (full account at
+# the match block below). So ClusterPolicy ALSO needs the provider groups
+# enumerated — the first of the two options above. What it still buys over
+# ValidatingPolicy is `<group>/*/*`: one line per provider rather than one per
+# kind, expanded correctly into a webhook rule. The same group deprecation
+# applies to database-claim-budget.yaml.
 #
 # Migration trigger: the first Kyverno release whose notes schedule removal of
 # `kyverno.io/v1`. By then the check to make is whether `apiGroups` has grown a
