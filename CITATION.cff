@@ -1,0 +1,20 @@
+cff-version: 1.2.0
+message: "If you use or build on this work, please cite it as below."
+type: software
+title: "Platform Factory: platform-config"
+abstract: "The Argo CD root of the Platform Factory reference implementation: an app-of-apps that installs and configures the shared platform layer (Crossplane, Kyverno, Gateway API, the System and Database abstractions)."
+authors:
+  - family-names: Patel
+    given-names: Ronak
+    affiliation: thecloudgeek LLC
+repository-code: "https://github.com/platform-factory/platform-config"
+url: "https://github.com/thecloudgeek/platform-factory"
+license: Apache-2.0
+keywords:
+  - Platform Factory
+  - platform engineering
+  - internal developer platform
+  - GitOps
+  - Kubernetes
+  - Crossplane
+  - Argo CD
