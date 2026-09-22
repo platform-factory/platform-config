@@ -37,6 +37,77 @@ kyverno/
 └── policies/                  the two validate-only ClusterPolicies, plus the read grant one of them needs
 ```
 
+## Values you must change to run this somewhere else
+
+This repo is meant to be copied, but copying it is not the one-value change
+it looks like. Two classes of literal in it are wired to this org, and copying
+the repo without changing them gives you a platform that either fails to
+install or — worse — installs against this org's repos instead of yours. The
+list below is two greps rather than a table of file and line numbers, because
+the grep cannot go stale and the table can.
+
+**Where the GitOps root reads from — change these first.**
+
+```
+grep -rn 'github.com/platform-factory' .
+```
+
+Seven `repoURL:` literals in `apps/` name this org: `crossplane.yaml`,
+`crossplane-providers.yaml`, `crossplane-platform.yaml`, `kyverno.yaml`,
+`compositions.yaml` and `kyverno-policies.yaml` point at
+`platform-factory/platform-config`, and `systems.yaml` points at
+`platform-factory/systems`. Repointing only the root `Application` in
+`platform-bootstrap`'s `3-argocd` layer is not enough: the root would read
+*your* `apps/`, and every child it creates would go straight back to syncing
+this org's repos. That failure is the quiet one at the GitOps layer: the root
+syncs cleanly from *your* fork, so nothing ever names the repo URL as the
+problem — your edits to your own `apps/` simply never take effect, and
+whatever breaks after that breaks against this org's project instead of
+yours. The grep's other hits are prose, the `NOTICE` and `CITATION.cff`
+attribution files, and one comment in an example.
+
+**Identity, target project and image paths.**
+
+```
+grep -rn platform-factory-ref .
+```
+
+`platform-factory-ref` is the Google Cloud project id.
+`crossplane/platform/environment.yaml` is the obvious one — it holds the
+project id, the VPC path and the registry bases, and it is the file the
+Compositions read. Six more files outside it hold the project id as a live
+value of their own, in three groups:
+
+- `apps/crossplane.yaml`, `apps/kyverno.yaml` and
+  `crossplane/providers/image-config.yaml` are the Artifact Registry paths
+  images are pulled through. These break **first**, at install, before any
+  provider authenticates to Google Cloud.
+- `crossplane/platform/provider-config.yaml` and
+  `crossplane/providers/runtime-configs.yaml` are the target project and the
+  Workload Identity annotation binding each provider's Kubernetes service
+  account to the Google service account. A wrong value here is an auth
+  failure, or a write that lands in the wrong project.
+- `crossplane/compositions/system/composition.yaml` holds per-key fallbacks
+  for the project and the registry. They exist for offline `crossplane
+  render`, but they fire whenever the key is missing from the environment
+  context — so a missing or unedited EnvironmentConfig renders against this
+  org's project rather than failing.
+
+Every other hit the grep returns, outside those seven files, is a comment or
+prose — the `crossplane/providers/provider-gcp-*.yaml` notes, two commented
+Workload Identity principals in `runtime-configs.yaml`, one commented
+service-account email in `provider-config.yaml`, the two
+`crossplane/compositions/database/` files and this README — so there is
+nothing to chase there.
+
+**`environment.yaml` is the single source only for what a Composition reads.**
+Its own header says so: "The per-environment constants a Composition is not
+allowed to hardcode." The registry overrides in `apps/`, the `ImageConfig`
+mirror rule and the provider identity wiring are outside that pipeline by
+construction — no Composition reads them — so they carry their own copies.
+None of it is templated today; that is deliberate later work, not an
+oversight.
+
 ## Order, and why it holds
 
 Argo CD applies sync waves lowest first and waits for a wave to be Healthy
@@ -68,10 +139,13 @@ before starting the next. That is used at two levels:
 ## The image plane
 
 ADR-0010: nodes are private and pull images through Artifact Registry
-remote repositories, never from the internet. Two places honor that here:
+remote repositories, never from the internet. Three places honor that here:
 
 - **Crossplane core** — `apps/crossplane.yaml` overrides the chart's
   `image.repository` to the `ghcr-io` remote.
+- **Kyverno** — `apps/kyverno.yaml` sets the chart's `global.image.registry`
+  to the `ghcr-io` remote, which reaches every Kyverno image whose own
+  `registry` is null. The chart's own default is `reg.kyverno.io`.
 - **Packages** — `crossplane/providers/image-config.yaml` is a single
   `ImageConfig` rewriting the `xpkg.crossplane.io` prefix to the `ghcr-io`
   remote. Provider manifests keep their canonical upstream names; the
@@ -163,7 +237,7 @@ metadata:
   name: svc-hello          # = namespace = AppProject = registry repo = GCP service account
 spec:
   owner:
-    team: checkout         # = checkout@thecloudgeek.io, by convention
+    team: payments         # = payments@thecloudgeek.io, by convention
     repo: platform-factory/svc-hello
   tier: standard
   securityTier: internal
@@ -292,10 +366,7 @@ question is still open. With `payments@` and `checkout@` existing and nested
 under `gke-security-groups@`, the per-System Google service account and all
 four `ProjectIAMMember`s — including the two naming
 `group:<team>@thecloudgeek.io` — reported `Synced=True` on the first reconcile
-[C]. (The Composition's own header still says *five* resources name the group:
-it counts all four `ProjectIAMMember`s, where in fact only the two `team` ones
-carry the group principal and the other two name the service account.
-Correcting that header is follow-up work.) So the happy path is confirmed. What is still **not verified** is the
+[C]. So the happy path is confirmed. What is still **not verified** is the
 failure path: nothing in the run asked `setIamPolicy` to accept a principal
 email that does not resolve, so "the group is a hard prerequisite" remains the
 instruction rather than a measured consequence. Do not read the green first
@@ -524,8 +595,10 @@ then passed with 111 seconds to spare.
 **It is also the last gate, not the first.** ADR-0014's order is: the XRD
 schema says no to everything it can express — `enum`, `pattern`, CEL — because
 that is free, checked offline in CI by `crossplane resource validate`, and
-produces the clearest message. Kyverno is only for the two things a schema
-cannot say, one per file:
+produces the clearest message. Kyverno is only for the three things a schema
+cannot say (ADR-0014 §3). The third — the metadata-spine pre-check — is
+deferred to M3 and needs no install beyond the one already here. The other
+two are policies today, one per file:
 
 | Policy | What a schema cannot say |
 |---|---|
@@ -646,7 +719,9 @@ This repo is built out in **M1** and extended in **M2**.
 
 ## Status
 
-**Status:** M2 — synced and first exercised on 2026-09-16.
+**Status:** M2 — synced and first exercised on 2026-09-16. The cluster was
+destroyed at the end of 2026-09-17 and the Cloud SQL instance parked, so
+nothing here is running today.
 
 M1 landed the spine and has been exercised: Crossplane core plus the GCP
 provider family, ordered by sync waves, images and packages routed through
