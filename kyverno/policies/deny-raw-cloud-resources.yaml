@@ -1,0 +1,162 @@
+# The reality gate behind "cloud resources come from the platform's charts,
+# not from kubectl" (ADR-0014 §3, ADR-0017 §7).
+#
+# WHY IT IS LOAD-BEARING. Config Connector installs a ClusterRole, cnrm-admin,
+# that aggregates into Kubernetes' built-in `admin` and `edit` with every verb
+# on every resource in its API groups (ADR-0017, Context). A team is bound to
+# `admin` in its own namespace, so from the moment the engine is installed a
+# team member can create, edit or delete a Config Connector object there with
+# kubectl: a Cloud SQL instance the platform never sees, or an edit to one it
+# does. The tenant's Argo CD project stops the same thing arriving through git
+# (it blacklists *.cnrm.cloud.google.com). This policy stops kubectl.
+#
+# WHAT CHANGED FROM M2. Under Crossplane the gate told the platform from a
+# tenant by IDENTITY: only Crossplane's service account composed cloud
+# objects. Now both arrive as Argo CD — the platform's charts through the
+# platform's project, and a tenant's k8s/ through the tenant's — so on the git
+# path the AppProject is the only wall between them, and this gate covers
+# kubectl only. The two gates no longer overlap (ADR-0017 §7). And it covers
+# three verbs where M2's covered one, because `admin` now carries all three.
+#
+# WHY THE GROUPS ARE LISTED BY NAME. A wildcard group in a kind selector is
+# written verbatim into the webhook and matches nothing; the M2 build found
+# that out when a hand-made Cloud SQL instance was admitted (ADR-0016 §3). A
+# concrete group with a wildcard version and kind is expanded correctly. The
+# engine's identity holds roles for exactly these three services (ADR-0018), so
+# these are the groups that can reach the cloud. Adding a service is an order
+# across two repos: its group is added here first, then its permission in
+# platform-roles (ADR-0017 §7).
+#
+# WHY kyverno.io/v1 ClusterPolicy, although the chart marks the group
+# deprecated: its successor's webhook rules accept a literal group or "*" and
+# nothing between, so the choice is the same as it was in M2 (see
+# charts/README.md's note on the next Kyverno bump).
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: deny-raw-cloud-resources
+  annotations:
+    policies.kyverno.io/title: Cloud resources come from the platform's charts, not kubectl
+    policies.kyverno.io/category: Platform Factory
+    policies.kyverno.io/severity: high
+    policies.kyverno.io/subject: Config Connector resources
+    policies.kyverno.io/description: >-
+      In a tenant namespace, only Argo CD and Config Connector itself may create,
+      change or delete a Config Connector object. A team asks for a database in
+      its claims.yaml; the platform's chart renders the cloud object, so the
+      platform owns its identity, labels and lifecycle.
+spec:
+  # Stated at the spec level as well as on each rule: Kyverno still defaults
+  # the deprecated spec-level field, and an absent value read as permanent
+  # drift in M2.
+  validationFailureAction: Enforce
+  # The rules key off WHO made the request, which exists only on an admission
+  # review; a background scan would have nothing to evaluate.
+  background: false
+  webhookConfiguration:
+    # Fail: Kyverno being down blocks these writes rather than waving them
+    # through. It blocks Argo CD's and the engine's writes too, and a tenant
+    # namespace's teardown (ADR-0017, Consequences). C-33 measures what that
+    # costs before anything changes for it (ADR-0019 §6).
+    failurePolicy: Fail
+  rules:
+    # ---------------------------------------------------------------------
+    - name: no-cloud-objects-by-hand-in-tenant-namespaces
+      skipBackgroundRequests: true
+      match:
+        any:
+          - resources:
+              kinds:
+                - "sql.cnrm.cloud.google.com/*/*"
+                - "iam.cnrm.cloud.google.com/*/*"
+                - "artifactregistry.cnrm.cloud.google.com/*/*"
+              operations:
+                - CREATE
+                - UPDATE
+              # A tenant namespace is one charts/system created: it carries the
+              # system label. C-31's scratch namespace deliberately does not.
+              namespaceSelector:
+                matchExpressions:
+                  - key: platform.thecloudgeek.io/system
+                    operator: Exists
+      exclude:
+        any:
+          - subjects:
+              # Argo CD applies the platform's charts.
+              - kind: ServiceAccount
+                name: argocd-application-controller
+                namespace: argocd
+              # Config Connector's two writers: the controller, and the
+              # deletion defender, which removes its finalizer with an update
+              # on every delete [C, v1.156.0
+              # pkg/controller/deletiondefender/controller.go].
+              - kind: ServiceAccount
+                name: cnrm-controller-manager
+                namespace: cnrm-system
+              - kind: ServiceAccount
+                name: cnrm-deletiondefender
+                namespace: cnrm-system
+      validate:
+        failureAction: Enforce
+        allowExistingViolations: true
+        message: >-
+          Cloud resources are not made by hand here. Ask for a database in your
+          service repo's claims.yaml, and the platform's chart creates the Cloud
+          SQL instance for you, with its identity, grants, labels and lifecycle.
+          A resource made directly would be one the platform cannot see, bill
+          or clean up. See charts/claims/README.md in platform-config.
+        deny: {}
+
+    # ---------------------------------------------------------------------
+    # Delete is its own rule because it lets two more identities through. When
+    # a tenant is offboarded, Kubernetes deletes its namespace, and the
+    # namespace controller and the garbage collector delete what is in it;
+    # refusing them would leave the namespace terminating for ever.
+    #
+    # Which identities those two controllers present to admission is
+    # [unverified]. These are the names upstream Kubernetes uses when the
+    # controller manager runs each controller under its own service account.
+    # The local rehearsal checks them on k3s, and the first cluster session on
+    # GKE (ADR-0017 §7).
+    - name: no-cloud-object-deletes-by-hand-in-tenant-namespaces
+      skipBackgroundRequests: true
+      match:
+        any:
+          - resources:
+              kinds:
+                - "sql.cnrm.cloud.google.com/*/*"
+                - "iam.cnrm.cloud.google.com/*/*"
+                - "artifactregistry.cnrm.cloud.google.com/*/*"
+              operations:
+                - DELETE
+              namespaceSelector:
+                matchExpressions:
+                  - key: platform.thecloudgeek.io/system
+                    operator: Exists
+      exclude:
+        any:
+          - subjects:
+              - kind: ServiceAccount
+                name: argocd-application-controller
+                namespace: argocd
+              - kind: ServiceAccount
+                name: cnrm-controller-manager
+                namespace: cnrm-system
+              - kind: ServiceAccount
+                name: cnrm-deletiondefender
+                namespace: cnrm-system
+              - kind: ServiceAccount
+                name: namespace-controller
+                namespace: kube-system
+              - kind: ServiceAccount
+                name: generic-garbage-collector
+                namespace: kube-system
+      validate:
+        failureAction: Enforce
+        allowExistingViolations: true
+        message: >-
+          Cloud resources are not deleted by hand here. To remove a database,
+          take its entry out of your service repo's claims.yaml; the cloud
+          instance is kept, and deleting it for real is a platform runbook step
+          (ADR-0015 §5).
+        deny: {}

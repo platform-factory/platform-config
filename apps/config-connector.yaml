@@ -1,0 +1,42 @@
+# The cloud engine (ADR-0017 §1) — sync wave 0 of the root app-of-apps, first,
+# because every later wave either gates its kinds (Kyverno) or renders them
+# (the tenants).
+#
+# Healthy means the ConfigConnector object reports healthy: Argo CD's built-in
+# check for *.cnrm.cloud.google.com reads its status.healthy (argo-cd v3.4.6
+# resource_customizations/_.cnrm.cloud.google.com/_/health.lua). By then the
+# operator has installed Config Connector's CRDs, so the next waves find them.
+#
+# On the M2b branch, targetRevision names the branch. It flips to main in the
+# PR that merges the branch (ADR-0017 §12); scripts/check_charts.py fails a
+# branch whose platform-config sources say main.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: config-connector
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/platform-factory/platform-config
+    targetRevision: m2b-config-connector
+    path: config-connector
+  destination:
+    server: https://kubernetes.default.svc
+    # The operator manifest names its own namespaces; this is only Argo CD's
+    # required placeholder.
+    namespace: configconnector-operator-system
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - ServerSideApply=true
+    retry:
+      limit: 10
+      backoff:
+        duration: 15s
+        factor: 2
+        maxDuration: 5m

@@ -1,0 +1,73 @@
+# Guards the first of a durable resource's deletion locks (ADR-0017 §9).
+#
+# WHY. The four durable kinds — the Cloud SQL instance, its database, its
+# database user, and a System's registry — carry
+# `cnrm.cloud.google.com/deletion-policy: abandon` from their first sync. When
+# the Kubernetes object is deleted, that annotation makes Config Connector let
+# go of the cloud resource instead of deleting it. It is an ordinary, editable
+# annotation, so a chart refactor that dropped it, or a hand edit, would turn
+# the next prune into a cloud delete. This policy refuses any update that
+# removes it or changes its value, while allowing it to be ADDED where it is
+# missing: adding it is also how a stuck object is released (ADR-0018 §5;
+# [I until C-31]).
+#
+# FOR EVERY IDENTITY, Argo CD and Config Connector included, and in every
+# namespace. It is the one Kyverno rule that binds the platform itself, and it
+# guards one annotation, not the form (ADR-0017 §7). It stays after
+# ADR-0018's narrowing: without delete permission, a delete Google refuses is
+# expected to leave the object stuck, so the engine should never reach that
+# wall.
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: keep-abandon-annotation
+  annotations:
+    policies.kyverno.io/title: A durable resource's abandon annotation is never removed
+    policies.kyverno.io/category: Platform Factory
+    policies.kyverno.io/severity: high
+    policies.kyverno.io/subject: Durable Config Connector resources
+    policies.kyverno.io/description: >-
+      Cloud SQL instances, databases, database users and Artifact Registry
+      repositories keep cnrm.cloud.google.com/deletion-policy: abandon once they
+      have it, so deleting the Kubernetes object never deletes the data.
+spec:
+  validationFailureAction: Enforce
+  # It compares the old object with the new, which exists only on an
+  # admission review.
+  background: false
+  webhookConfiguration:
+    failurePolicy: Fail
+  rules:
+    - name: abandon-stays
+      skipBackgroundRequests: true
+      match:
+        any:
+          - resources:
+              kinds:
+                - "sql.cnrm.cloud.google.com/v1beta1/SQLInstance"
+                - "sql.cnrm.cloud.google.com/v1beta1/SQLDatabase"
+                - "sql.cnrm.cloud.google.com/v1beta1/SQLUser"
+                - "artifactregistry.cnrm.cloud.google.com/v1beta1/ArtifactRegistryRepository"
+              operations:
+                - UPDATE
+      # Only an object that already has the annotation is guarded, so adding it
+      # to one that lacks it is always allowed.
+      preconditions:
+        all:
+          - key: "{{ request.oldObject.metadata.annotations.\"cnrm.cloud.google.com/deletion-policy\" || '' }}"
+            operator: Equals
+            value: abandon
+      validate:
+        failureAction: Enforce
+        allowExistingViolations: true
+        message: >-
+          This is a durable resource, and cnrm.cloud.google.com/deletion-policy:
+          abandon is what keeps a Kubernetes delete from deleting its data. It
+          cannot be removed or changed (ADR-0017 §9). Deleting the data is a
+          person's gcloud step (ADR-0015 §5).
+        deny:
+          conditions:
+            any:
+              - key: "{{ request.object.metadata.annotations.\"cnrm.cloud.google.com/deletion-policy\" || '' }}"
+                operator: NotEquals
+                value: abandon
