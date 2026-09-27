@@ -1,0 +1,203 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "One System: its tenant file, the retired list and the environment's facts",
+  "description": "The System XRD's rules, carried over (ADR-0017 §6), plus names a System may not take. The tenant file is approved by the platform in the systems repo, so this schema guards against mistakes; the claims schema is the tenant boundary. Every level is closed.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "apiVersion",
+    "kind",
+    "metadata",
+    "spec",
+    "retired",
+    "environment"
+  ],
+  "properties": {
+    "apiVersion": {
+      "const": "platform.thecloudgeek.io/v1alpha1"
+    },
+    "kind": {
+      "const": "System"
+    },
+    "metadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name"
+      ],
+      "properties": {
+        "name": {
+          "$ref": "#/$defs/systemName"
+        }
+      }
+    },
+    "spec": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "owner",
+        "securityTier",
+        "size"
+      ],
+      "properties": {
+        "owner": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "team",
+            "repo"
+          ],
+          "properties": {
+            "team": {
+              "description": "The owning team, as a bare name; the group is <team>@<orgDomain> (ADR-0012 §3). Both a Google Group local part and a Kubernetes label value.",
+              "type": "string",
+              "minLength": 2,
+              "maxLength": 63,
+              "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"
+            },
+            "repo": {
+              "description": "The service's repository, as org/name.",
+              "type": "string",
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$"
+            }
+          }
+        },
+        "tier": {
+          "description": "What the platform owes this System when it breaks. Defaults to standard. A critical System is the entitlement a size-L database needs (ADR-0017 §6).",
+          "enum": [
+            "standard",
+            "critical"
+          ]
+        },
+        "securityTier": {
+          "enum": [
+            "internal",
+            "restricted"
+          ]
+        },
+        "size": {
+          "description": "A quota class: S, M or L.",
+          "enum": [
+            "S",
+            "M",
+            "L"
+          ]
+        }
+      }
+    },
+    "retired": {
+      "description": "systems/retired.yaml: names that may not be used again while durable resources carry them (ADR-0017 §9). The template refuses a System whose name is here.",
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z][a-z0-9-]{4,28}[a-z0-9]$"
+      }
+    },
+    "environment": {
+      "$ref": "#/$defs/environment"
+    }
+  },
+  "$defs": {
+    "systemName": {
+      "description": "6-30 characters: lowercase letters, digits and hyphens, starting with a letter and ending with a letter or digit (the name becomes a Google service account ID). It may not end in -system or -claims, which would collide with another System's Argo CD Applications, and may not take a name the platform or GKE already uses (ADR-0017 §6).",
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]{4,28}[a-z0-9]$",
+      "allOf": [
+        {
+          "not": {
+            "pattern": "-(system|claims)$"
+          }
+        },
+        {
+          "not": {
+            "pattern": "^(kube|gke|gmp|cnrm|configconnector)-"
+          }
+        },
+        {
+          "not": {
+            "enum": [
+              "argocd",
+              "default",
+              "kyverno",
+              "systems",
+              "config-connector",
+              "kyverno-policies",
+              "crossplane",
+              "crossplane-providers",
+              "crossplane-platform",
+              "compositions",
+              "jumpbox",
+              "crossplane-provider-gcp",
+              "docker-hub",
+              "quay-io",
+              "ghcr-io",
+              "ecr-public",
+              "registry-k8s-io"
+            ]
+          }
+        }
+      ]
+    },
+    "environment": {
+      "description": "The environment's facts, from platform-config/environments/<env>.yaml. Every key is required and non-empty (ADR-0017 §8). This definition is identical in charts/system and charts/claims; CI checks that.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "projectID",
+        "region",
+        "orgDomain",
+        "gitBase",
+        "network",
+        "registryLocation",
+        "registryBase",
+        "dockerHubRemote",
+        "platformConfigRepo",
+        "platformRevision"
+      ],
+      "properties": {
+        "projectID": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9-]{4,28}[a-z0-9]$"
+        },
+        "region": {
+          "type": "string",
+          "pattern": "^[a-z]+-[a-z]+[0-9]+$"
+        },
+        "orgDomain": {
+          "type": "string",
+          "pattern": "^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$"
+        },
+        "gitBase": {
+          "type": "string",
+          "pattern": "^https://[^/\\s]+$"
+        },
+        "network": {
+          "type": "string",
+          "pattern": "^projects/[a-z][a-z0-9-]{4,28}[a-z0-9]/global/networks/[a-z]([a-z0-9-]*[a-z0-9])?$"
+        },
+        "registryLocation": {
+          "type": "string",
+          "pattern": "^[a-z]+(-[a-z]+[0-9]+)?$"
+        },
+        "registryBase": {
+          "type": "string",
+          "pattern": "^[a-z0-9-]+-docker\\.pkg\\.dev/[a-z][a-z0-9-]{4,28}[a-z0-9]$"
+        },
+        "dockerHubRemote": {
+          "type": "string",
+          "pattern": "^[a-z0-9-]+-docker\\.pkg\\.dev/[a-z][a-z0-9-]{4,28}[a-z0-9]/[a-z]([a-z0-9-]*[a-z0-9])?$"
+        },
+        "platformConfigRepo": {
+          "type": "string",
+          "pattern": "^https://[^\\s]+[^/\\s]$"
+        },
+        "platformRevision": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._/-]*$"
+        }
+      }
+    }
+  }
+}

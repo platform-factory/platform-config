@@ -1,0 +1,180 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "A service's claims, merged with the platform's facts",
+  "description": "This schema is a security boundary (ADR-0017 §6). It sees the merged values: the service's claims.yaml plus the system and environment objects the platform writes into helm.valuesObject. Every level is closed, so a key nobody listed is refused rather than ignored.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["system", "environment"],
+  "properties": {
+    "databases": {
+      "description": "Your databases, keyed by name. The name becomes part of the Cloud SQL instance name <system>-<name>, so it may use only lowercase letters and digits: no hyphen (ADR-0017 §5). At most two per System.",
+      "type": "object",
+      "maxProperties": 2,
+      "propertyNames": {
+        "pattern": "^[a-z][a-z0-9]{1,33}$"
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/database"
+      }
+    },
+    "system": {
+      "description": "Written by the platform from the System's tenant file. A value you set here is replaced.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "team", "tier"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9-]{4,28}[a-z0-9]$"
+        },
+        "team": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 63,
+          "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"
+        },
+        "tier": {
+          "description": "The System's tier, approved by the platform in the systems repo. It is the entitlement that size L needs (ADR-0017 §6).",
+          "enum": ["standard", "critical"]
+        }
+      }
+    },
+    "environment": {
+      "$ref": "#/$defs/environment"
+    }
+  },
+  "if": {
+    "required": ["system"],
+    "properties": {
+      "system": {
+        "required": ["tier"],
+        "properties": {
+          "tier": { "const": "standard" }
+        }
+      }
+    }
+  },
+  "then": {
+    "properties": {
+      "databases": {
+        "description": "In a standard-tier System, no database may be size L. Size L needs the System itself to be critical, which the platform approves in the systems repo.",
+        "additionalProperties": {
+          "properties": {
+            "size": { "not": { "const": "L" } }
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "database": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["engine", "region", "size"],
+      "properties": {
+        "engine": {
+          "description": "Postgres major version. Only the versions the platform supports are listed.",
+          "enum": ["POSTGRES_16", "POSTGRES_17"]
+        },
+        "region": {
+          "description": "Where the data lives. Keep it in the cluster's region unless you have a reason not to.",
+          "enum": ["us-central1", "us-east1"]
+        },
+        "size": {
+          "description": "A size class, not a machine type. S is shared-core, M is 2 vCPU / 7.5 GB, L is 4 vCPU / 15 GB and regional (high availability).",
+          "enum": ["S", "M", "L"]
+        },
+        "tier": {
+          "description": "How much the business loses if this database is down. Defaults to standard. Size L needs tier critical here AND a critical System.",
+          "enum": ["standard", "critical"]
+        },
+        "backups": {
+          "description": "Daily automated backups, taken only while the instance runs, so a parked instance takes none. Point-in-time recovery comes only with size L. Defaults to true; only size S may turn backups off.",
+          "type": "boolean"
+        }
+      },
+      "allOf": [
+        {
+          "description": "Size L needs tier: critical, written out.",
+          "if": {
+            "required": ["size"],
+            "properties": { "size": { "const": "L" } }
+          },
+          "then": {
+            "required": ["tier"],
+            "properties": { "tier": { "const": "critical" } }
+          }
+        },
+        {
+          "description": "Only size S may turn backups off.",
+          "if": {
+            "required": ["backups"],
+            "properties": { "backups": { "const": false } }
+          },
+          "then": {
+            "properties": { "size": { "const": "S" } }
+          }
+        }
+      ]
+    },
+    "environment": {
+      "description": "The environment's facts, from platform-config/environments/<env>.yaml. Every key is required and non-empty (ADR-0017 §8). This definition is identical in charts/system and charts/claims; CI checks that.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "projectID",
+        "region",
+        "orgDomain",
+        "gitBase",
+        "network",
+        "registryLocation",
+        "registryBase",
+        "dockerHubRemote",
+        "platformConfigRepo",
+        "platformRevision"
+      ],
+      "properties": {
+        "projectID": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9-]{4,28}[a-z0-9]$"
+        },
+        "region": {
+          "type": "string",
+          "pattern": "^[a-z]+-[a-z]+[0-9]+$"
+        },
+        "orgDomain": {
+          "type": "string",
+          "pattern": "^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$"
+        },
+        "gitBase": {
+          "type": "string",
+          "pattern": "^https://[^/\\s]+$"
+        },
+        "network": {
+          "type": "string",
+          "pattern": "^projects/[a-z][a-z0-9-]{4,28}[a-z0-9]/global/networks/[a-z]([a-z0-9-]*[a-z0-9])?$"
+        },
+        "registryLocation": {
+          "type": "string",
+          "pattern": "^[a-z]+(-[a-z]+[0-9]+)?$"
+        },
+        "registryBase": {
+          "type": "string",
+          "pattern": "^[a-z0-9-]+-docker\\.pkg\\.dev/[a-z][a-z0-9-]{4,28}[a-z0-9]$"
+        },
+        "dockerHubRemote": {
+          "type": "string",
+          "pattern": "^[a-z0-9-]+-docker\\.pkg\\.dev/[a-z][a-z0-9-]{4,28}[a-z0-9]/[a-z]([a-z0-9-]*[a-z0-9])?$"
+        },
+        "platformConfigRepo": {
+          "type": "string",
+          "pattern": "^https://[^\\s]+[^/\\s]$"
+        },
+        "platformRevision": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._/-]*$"
+        }
+      }
+    }
+  }
+}

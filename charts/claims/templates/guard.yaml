@@ -1,0 +1,13 @@
+{{- /*
+Renders nothing. It stops the render if the claims are about to be applied
+under a System that is not the one they name.
+
+Every name in this chart is built from .Release.Namespace, which Argo CD sets
+from the Application's destination and which no value file can change
+(ADR-0017 §4). `system.name` comes from the platform's valuesObject. If the two
+ever disagree, something upstream is wrong, and rendering would create cloud
+objects under one System's name for another.
+*/ -}}
+{{- if ne .Values.system.name .Release.Namespace }}
+{{- fail (printf "system.name is %q but this release is in namespace %q; the claims chart only renders into its own System's namespace (ADR-0017 §4)." .Values.system.name .Release.Namespace) }}
+{{- end }}

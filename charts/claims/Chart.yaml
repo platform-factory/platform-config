@@ -1,0 +1,8 @@
+apiVersion: v2
+name: claims
+description: >-
+  A service's database claims, turned into Cloud SQL through Config Connector.
+  Only the platform renders this chart (ADR-0017 §4); the service supplies a
+  claims.yaml and nothing else.
+type: application
+version: 0.1.0

@@ -1,0 +1,10 @@
+# Deliberately empty.
+#
+# A chart's values.yaml is a value layer beneath every other, so a key left
+# here would quietly fill in one that a real input forgot (ADR-0017 §6). This
+# chart's inputs are three value files, in this order, the last one winning:
+#   1. systems/tenants/<name>.yaml — the tenant file, unchanged since M2
+#      (apiVersion, kind, metadata, spec);
+#   2. systems/retired.yaml        — `retired:`, names not to be reused;
+#   3. environments/<env>.yaml     — `environment:`, this repo's facts.
+# values.schema.json checks the merged result and refuses anything else.

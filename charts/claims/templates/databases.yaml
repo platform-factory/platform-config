@@ -1,0 +1,208 @@
+{{- /*
+One Cloud SQL Postgres per entry under `databases:`, and nothing else.
+
+WHAT EACH CLAIM GETS
+  SQLInstance    <system>-<claim>           private IP only, IAM login on    durable
+  SQLDatabase    <system>-<claim>-app       the database the app uses        durable
+  SQLUser        <system>-<claim>-iam-user  the app's identity as a role     durable
+  ConfigMap      <claim>-connection         what the app needs to connect
+  Job            <claim>-seed-<hash>        creates <claim>-admin once
+  Job            <claim>-grant-<hash>       gives the IAM user its privileges
+
+THIS CHART EMITS NOTHING THAT DOES NOT BELONG TO A CLAIM (ADR-0019 §2). So a
+claims.yaml with no databases, a missing claims.yaml and a misnamed claims.yml
+are all an empty render, and Argo CD refuses the automated sync that would
+prune everything: removing a System's last database is a person's step, and a
+misnamed file deletes nothing. The seed Job's service account lives in
+charts/system for the same reason.
+
+DURABLE MEANS THREE THINGS HERE (ADR-0015, ADR-0017 §9):
+  - the annotation cnrm.cloud.google.com/deletion-policy: abandon, from the
+    first sync. When Argo CD prunes the object, Config Connector lets go of the
+    cloud resource instead of deleting it. A Kyverno rule stops anyone,
+    Argo CD included, from removing or changing it.
+  - Cloud SQL's own deletion protection, on the instance;
+    spec.deletionPolicy: ABANDON, on the database.
+  - from ADR-0018's narrowing on, no delete permission in the engine's roles.
+Nothing in this file deletes data. Deleting data is a person's gcloud command
+(ADR-0015 §5).
+
+NAMES. Every name comes from .Release.Namespace, which is the System, and the
+claim's key. A claim's key has no hyphen (the schema), so whatever follows the
+last hyphen of an instance name is the claim, and two Systems can never produce
+the same instance name (ADR-0017 §5).
+*/ -}}
+{{- $ns := .Release.Namespace }}
+{{- $project := include "claims.env" (list .Values "projectID") }}
+{{- $network := include "claims.env" (list .Values "network") }}
+{{- $dockerHub := include "claims.env" (list .Values "dockerHubRemote") }}
+{{- /* Postgres 16 client; the server's version is the claim's `engine`. */ -}}
+{{- $image := printf "%s/library/postgres:16-alpine" $dockerHub }}
+
+{{- /*
+ADR-0014 §1: `size` is a class, and this is where it becomes a machine type,
+so a bigger instance is a platform decision made in review. L is regional
+(a standby in a second zone); Cloud SQL requires point-in-time recovery on a
+regional Postgres instance, so PITR is on exactly when backups are on and the
+instance is regional (ADR-0017 §5).
+*/ -}}
+{{- $sizes := dict
+      "S" (dict "tier" "db-f1-micro"       "availability" "ZONAL")
+      "M" (dict "tier" "db-custom-2-7680"  "availability" "ZONAL")
+      "L" (dict "tier" "db-custom-4-15360" "availability" "REGIONAL") }}
+
+{{- range $claim, $db := .Values.databases }}
+{{- $size := index $sizes $db.size }}
+{{- /* Helm's `default` treats false as empty, so `backups: false` would read as
+       true. hasKey tells "absent" from "false". */ -}}
+{{- $backups := true }}
+{{- if hasKey $db "backups" }}{{ $backups = $db.backups }}{{ end }}
+{{- $pitr := and $backups (eq $size.availability "REGIONAL") }}
+{{- $instance := printf "%s-%s" $ns $claim }}
+{{- $secret := printf "%s-admin" $claim }}
+{{- $database := "app" }}
+{{- /* Cloud SQL names a service account's database user by its email without
+       ".gserviceaccount.com" (ADR-0013). The System's service account is named
+       after the System (charts/system). */ -}}
+{{- $iamUser := printf "%s@%s.iam" $ns $project }}
+---
+apiVersion: sql.cnrm.cloud.google.com/v1beta1
+kind: SQLInstance
+metadata:
+  name: {{ $instance }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "claims.labels" (list $ns $claim) | nindent 4 }}
+    # Config Connector turns metadata.labels into the instance's cloud labels
+    # and drops every key containing "/" (ADR-0017 §8). These two unprefixed
+    # keys are how `cycle.sh park` and ADR-0015's orphan runbook find the
+    # instance from the cloud side.
+    system: {{ $ns | quote }}
+    database: {{ $claim | quote }}
+  annotations:
+    {{- include "claims.cnrmAnnotations" $project | nindent 4 }}
+    cnrm.cloud.google.com/deletion-policy: abandon
+spec:
+  # The instance's name in Cloud SQL. Adoption is by this name: on a rebuild,
+  # Config Connector finds the existing instance and takes it over.
+  resourceID: {{ $instance }}
+  databaseVersion: {{ $db.engine | quote }}
+  region: {{ $db.region | quote }}
+  # Read from the Secret the seed Job creates. Cloud SQL uses it only when it
+  # creates the instance; on an instance that already exists, a different value
+  # here never triggers an update [C, v1.156.0 sqlinstance_equality.go]. Whether
+  # it would change the live password when some other field triggers an update
+  # is [I until C-29].
+  rootPassword:
+    valueFrom:
+      secretKeyRef:
+        name: {{ $secret }}
+        key: password
+  settings:
+    tier: {{ $size.tier }}
+    # Stated, not defaulted. Cloud SQL defaults Postgres 16+ to ENTERPRISE_PLUS,
+    # which does not offer these machine types.
+    edition: ENTERPRISE
+    availabilityType: {{ $size.availability }}
+    # ADR-0015 §4: `cycle.sh park` sets NEVER between sessions to stop the
+    # instance's charges. The next sync sets it back, so a rebuild wakes the
+    # instance with no separate step.
+    activationPolicy: ALWAYS
+    deletionProtectionEnabled: true
+    databaseFlags:
+      # ADR-0013 rests on this flag: without it there is no IAM login, and the
+      # application would need a password after all.
+      - name: cloudsql.iam_authentication
+        value: "on"
+    backupConfiguration:
+      enabled: {{ $backups }}
+      pointInTimeRecoveryEnabled: {{ $pitr }}
+      # Start time and retention are left unset on purpose. Config Connector
+      # ignores an unset start time when it compares, and defaults retention to
+      # seven backups, which is what the live instance has [C, v1.156.0
+      # sqlinstance_defaults.go and sqlinstance_equality.go].
+    ipConfiguration:
+      # Private IP only. Config Connector's default when this block is absent
+      # is a PUBLIC IPv4 address [C, v1.156.0 sqlinstance_defaults.go], so the
+      # block is never optional.
+      ipv4Enabled: false
+      privateNetworkRef:
+        external: {{ $network | quote }}
+    # Also unset on purpose, because Config Connector copies them from the live
+    # instance when it adopts one: the zone and the disk size [C, same file].
+---
+apiVersion: sql.cnrm.cloud.google.com/v1beta1
+kind: SQLDatabase
+metadata:
+  name: {{ $instance }}-app
+  namespace: {{ $ns }}
+  labels:
+    {{- include "claims.labels" (list $ns $claim) | nindent 4 }}
+  annotations:
+    {{- include "claims.cnrmAnnotations" $project | nindent 4 }}
+    cnrm.cloud.google.com/deletion-policy: abandon
+spec:
+  resourceID: {{ $database }}
+  instanceRef:
+    name: {{ $instance }}
+  # This kind's own second lock: "abandon" rather than drop the database.
+  deletionPolicy: ABANDON
+---
+apiVersion: sql.cnrm.cloud.google.com/v1beta1
+kind: SQLUser
+metadata:
+  name: {{ $instance }}-iam-user
+  namespace: {{ $ns }}
+  labels:
+    {{- include "claims.labels" (list $ns $claim) | nindent 4 }}
+  annotations:
+    {{- include "claims.cnrmAnnotations" $project | nindent 4 }}
+    # Durable on purpose (ADR-0017 §9): Cloud SQL cannot delete a Postgres role
+    # that has been granted privileges, and the GRANT Job grants them.
+    cnrm.cloud.google.com/deletion-policy: abandon
+spec:
+  resourceID: {{ $iamUser | quote }}
+  instanceRef:
+    name: {{ $instance }}
+  # No password anywhere: Cloud SQL authenticates this user from a short-lived
+  # token minted from the pod's Google identity (ADR-0013 §2).
+  type: CLOUD_IAM_SERVICE_ACCOUNT
+---
+# What the application needs to connect. Nothing here is secret: connecting is
+# an IAM question, not a credential question. The private IP is not here,
+# because a render from git cannot know it; applications connect through the
+# Cloud SQL Auth Proxy by connection name.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $claim }}-connection
+  namespace: {{ $ns }}
+  labels:
+    {{- include "claims.labels" (list $ns $claim) | nindent 4 }}
+data:
+  connectionName: {{ printf "%s:%s:%s" $project $db.region $instance | quote }}
+  databaseName: {{ $database | quote }}
+  iamUser: {{ $iamUser | quote }}
+{{- $seedSpec := include "claims.seedJobSpec" (dict "system" $ns "claim" $claim "secret" $secret "image" $image) }}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ printf "%s-seed-%s" $claim ($seedSpec | sha256sum | trunc 10) }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "claims.labels" (list $ns $claim) | nindent 4 }}
+spec:
+  {{- $seedSpec | nindent 2 }}
+{{- $grantSpec := include "claims.grantJobSpec" (dict "system" $ns "claim" $claim "secret" $secret "image" $image "project" $project "instance" $instance "iamUser" $iamUser "database" $database) }}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ printf "%s-grant-%s" $claim ($grantSpec | sha256sum | trunc 10) }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "claims.labels" (list $ns $claim) | nindent 4 }}
+spec:
+  {{- $grantSpec | nindent 2 }}
+{{- end }}

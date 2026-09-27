@@ -1,0 +1,58 @@
+{{- $name := .Values.metadata.name }}
+{{- $project := include "system.env" (list .Values "projectID") }}
+{{- /*
+The quota classes. The schema says S/M/L and never says `cpu:`, so the numbers
+live here, in one place (ADR-0012 §6). Requests are the real ceiling; limits
+are twice the requests, so a bursty pod is not throttled at once.
+*/ -}}
+{{- $quotas := dict
+      "S" (dict "requestsCpu" "2" "requestsMemory" "4Gi"  "limitsCpu" "4"  "limitsMemory" "8Gi"  "pods" "20")
+      "M" (dict "requestsCpu" "4" "requestsMemory" "8Gi"  "limitsCpu" "8"  "limitsMemory" "16Gi" "pods" "40")
+      "L" (dict "requestsCpu" "8" "requestsMemory" "16Gi" "limitsCpu" "16" "limitsMemory" "32Gi" "pods" "80") }}
+{{- $q := index $quotas .Values.spec.size }}
+---
+# The namespace. The System's name is the namespace's name, which is why a
+# System's name never changes: renaming it is a migration, not an edit.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "system.labels" . | nindent 4 }}
+  annotations:
+    platform.thecloudgeek.io/repo: {{ .Values.spec.owner.repo | quote }}
+    # The project Config Connector uses for any object in this namespace that
+    # lost its own project annotation. Without it, the namespace's NAME would
+    # be taken as the project. It is written in the same manifest that creates
+    # the namespace, because Config Connector reads it only if it is there
+    # before the first resource (ADR-0017 §8).
+    cnrm.cloud.google.com/project-id: {{ $project | quote }}
+    # A chart change that stopped rendering this Namespace must not delete it,
+    # and every workload and Secret in it, for every tenant at once. With
+    # Prune=false, Argo CD leaves it standing and reports OutOfSync. Deleting
+    # the tenant's Application still deletes it: a cascade delete reads only
+    # the Delete= option (ADR-0019 §1).
+    argocd.argoproj.io/sync-options: Prune=false
+---
+# The quota, from the size class.
+#
+# A quota on limits.cpu and limits.memory makes both mandatory: every
+# container in this namespace must set them, or its pod is refused at
+# admission while the Deployment still looks applied. That is a deliberate
+# contract (an unbounded container is how one tenant starves the node pool).
+# The tenant cannot relax it: its Argo CD project refuses ResourceQuota and
+# LimitRange objects.
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: {{ $name }}
+  namespace: {{ $name }}
+  labels:
+    {{- include "system.labels" . | nindent 4 }}
+spec:
+  hard:
+    requests.cpu: {{ $q.requestsCpu | quote }}
+    requests.memory: {{ $q.requestsMemory | quote }}
+    limits.cpu: {{ $q.limitsCpu | quote }}
+    limits.memory: {{ $q.limitsMemory | quote }}
+    pods: {{ $q.pods | quote }}
