@@ -308,7 +308,12 @@ def check_svc_hello_matches_live(systems, environment):
     update changes the instance. The live values below were read with
     `gcloud sql instances describe svc-hello-main` on 2026-09-22 (ADR-0017 §5).
     The full field-by-field comparison with the live instance is a step of the
-    first cluster session; this pins the fields the chart sets."""
+    first cluster session; this pins the fields the chart sets.
+
+    Two differences from what is live are intended, so the first update is
+    not empty: the chart states activationPolicy ALWAYS, which wakes a parked
+    instance (ADR-0017 §12), and it leaves out the old engine's `managed-by`
+    label (ADR-0017 §8)."""
     tenant = yaml.safe_load((systems / "tenants" / "svc-hello.yaml").read_text())
     claims = {"databases": {"main": {"engine": "POSTGRES_16", "region": "us-central1", "size": "S", "tier": "standard", "backups": True}}}
     with tempfile.TemporaryDirectory() as folder:
@@ -322,6 +327,12 @@ def check_svc_hello_matches_live(systems, environment):
     instance = objects["SQLInstance"]
     settings = instance["spec"]["settings"]
     env = environment["environment"]
+    # The live instance carries one label more than the chart renders:
+    # `managed-by: crossplane`, stamped by the old engine. The new engine's
+    # first update removes it, on purpose. The row below compares the other
+    # labels and says so, rather than calling the chart's two labels "live".
+    live_labels = {"system": "svc-hello", "database": "main", "managed-by": "crossplane"}
+    kept_labels = {key: value for key, value in live_labels.items() if key != "managed-by"}
     expected = {
         "instance name": (instance["spec"]["resourceID"], "svc-hello-main"),
         "databaseVersion": (instance["spec"]["databaseVersion"], "POSTGRES_16"),
@@ -335,7 +346,7 @@ def check_svc_hello_matches_live(systems, environment):
         "private network": (settings["ipConfiguration"]["privateNetworkRef"]["external"], env["network"]),
         "deletion protection": (settings["deletionProtectionEnabled"], True),
         "IAM login flag": (settings["databaseFlags"], [{"name": "cloudsql.iam_authentication", "value": "on"}]),
-        "cloud labels": ({k: v for k, v in instance["metadata"]["labels"].items() if "/" not in k}, {"system": "svc-hello", "database": "main"}),
+        "cloud labels, all but managed-by (live has it; the engine swap removes it)": ({k: v for k, v in instance["metadata"]["labels"].items() if "/" not in k}, kept_labels),
         "database name": (objects["SQLDatabase"]["spec"]["resourceID"], "app"),
         "database deletionPolicy": (objects["SQLDatabase"]["spec"]["deletionPolicy"], "ABANDON"),
         "IAM user": (objects["SQLUser"]["spec"]["resourceID"], f"svc-hello@{env['projectID']}.iam"),
