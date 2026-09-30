@@ -1,4 +1,15 @@
-# Vendored charts
+# Charts
+
+Two kinds of chart live here.
+
+**The platform's own charts**, from M2b (ADR-0017): `system/`, everything one
+tenant gets, and `claims/`, a service's databases. Each has its own README.
+They are the recipes, and `scripts/check_charts.py` renders and tests them on
+every pull request.
+
+**Vendored charts**, everything else, described below.
+
+## Vendored charts
 
 Charts here are copied from upstream, unmodified, and rendered by Argo CD
 straight from this repo. They are not fetched from a chart repository at

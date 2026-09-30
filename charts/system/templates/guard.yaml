@@ -1,0 +1,16 @@
+{{- /*
+Renders nothing. It stops the render of a System whose name is on the retired
+list (ADR-0017 §9).
+
+Why: the platform finds a System's cloud resources again by name. A new
+System that took a retired name would adopt the old one's database instances,
+registry and database user, and its service account would log in as that
+user. So a removed System's name stays on systems/retired.yaml until a person
+has deleted the last durable resource carrying it (ADR-0015 §5).
+
+This check cannot live in the schema: JSON Schema cannot compare one value
+(metadata.name) with another (the retired list).
+*/ -}}
+{{- if has .Values.metadata.name .Values.retired }}
+{{- fail (printf "System %q is on systems/retired.yaml. Its name may not be used again until its durable resources are deleted (ADR-0017 §9). To restore the same System on purpose, take the name off the list in the same PR." .Values.metadata.name) }}
+{{- end }}

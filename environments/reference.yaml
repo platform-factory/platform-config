@@ -1,0 +1,64 @@
+# The facts that differ between one environment of this platform and another
+# (ADR-0017 §8). It replaces crossplane/platform/environment.yaml, the
+# EnvironmentConfig the Crossplane recipes read.
+#
+# WHO READS IT. Both charts, as a Helm value file:
+#   - charts/system gets it as the last of three value files, after the tenant
+#     file and systems/retired.yaml. The last file wins, so a tenant file can
+#     never replace one of these facts.
+#   - charts/claims never reads this file directly. charts/system copies every
+#     key into the claims Application's `helm.valuesObject`, which outranks
+#     every value file, so a service's claims.yaml cannot replace one either
+#     (ADR-0017 §4).
+#
+# EVERY KEY IS REQUIRED AND NON-EMPTY. Both charts read each key through
+# Helm's `required`, no template gives one a default, and neither chart's
+# values.yaml carries one. The Crossplane recipe used to fill a missing key
+# with this reference build's value, so a second environment that forgot a
+# key would have quietly rendered against the reference project. Now it fails
+# the render and names the key. The CI in this repo deletes and blanks each key
+# in turn to prove it.
+#
+# EVERY VALUE HERE IS ALSO WRITTEN DOWN IN TERRAFORM. This file is the
+# read-side copy; platform-bootstrap is the write side (0-foundation for the
+# project and the registry remotes, 1-network for the VPC). They are kept in
+# step by review, not by a mechanism.
+environment:
+  # 0-foundation: the one project everything in this reference build lives in.
+  projectID: platform-factory-ref
+
+  # The region the cluster and most resources live in. A database claim may
+  # still name another region its schema allows.
+  region: us-central1
+
+  # ADR-0012 §3: a team named `payments` is the Google Group
+  # payments@<orgDomain>. This is the Google Workspace domain.
+  orgDomain: thecloudgeek.io
+
+  # The Git host, scheme included, no trailing slash. A tenant file names its
+  # repo only as `org/name`; this supplies the rest of the URL.
+  gitBase: https://github.com
+
+  # The VPC, in the form Cloud SQL's private network reference wants.
+  # 1-network owns it; its Private Services Access peering is what gives a
+  # private-IP database an address at all.
+  network: projects/platform-factory-ref/global/networks/platform-factory-ref
+
+  # ADR-0010 image plane. `registryBase` is where each System's own repository
+  # lives; `dockerHubRemote` is the pull-through cache the platform's Jobs pull
+  # their images through. Its location is spelled separately because a
+  # registry's location is part of its hostname and need not equal `region`.
+  registryLocation: us-central1
+  registryBase: us-central1-docker.pkg.dev/platform-factory-ref
+  dockerHubRemote: us-central1-docker.pkg.dev/platform-factory-ref/docker-hub
+
+  # This repository, which the claims Application renders charts/claims from.
+  # A fork in another organisation changes this line, not a chart.
+  platformConfigRepo: https://github.com/platform-factory/platform-config
+
+  # The revision of THIS repository that every chart-emitted Application reads
+  # (ADR-0017 §12). While the engine swap is being built and tested, it names
+  # the M2b branch, so a build from the branch renders the branch's charts and
+  # not main's. It flips to `main` in the same PR that merges the branch, and
+  # this repo's CI fails a branch whose platform-config sources say `main`.
+  platformRevision: m2b-config-connector

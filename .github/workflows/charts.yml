@@ -1,0 +1,51 @@
+# This repository's first CI (ADR-0017 §6): the charts' schemas are now the
+# boundary between a tenant and the platform, so every pull request renders
+# them the way Argo CD will and tries every refusal.
+#
+# What it checks, and why, is at the top of scripts/check_charts.py. In short:
+# every must-fail case in tests/charts/cases.yaml is refused for the reason it
+# names; every environment key is required; a claims.yaml cannot change the
+# platform's facts; the real tenant files render; and svc-hello's database
+# renders what is live.
+#
+# Advisory for now: no repo in this org requires a passing check yet
+# (ADR-0018 §7), so a red result shows a mistake; it does not block a merge.
+name: charts
+
+on:
+  pull_request:
+  push:
+    branches: [main, m2b-config-connector]
+
+permissions:
+  contents: read
+
+jobs:
+  charts:
+    name: render and refuse
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The real tenant files and retired list. The systems repo is public, so
+      # no token is needed.
+      - uses: actions/checkout@v4
+        with:
+          repository: platform-factory/systems
+          ref: main
+          path: systems-repo
+
+      - name: Install Helm 3.19.4, the version Argo CD v3.4.6 bundles
+        env:
+          HELM_VERSION: v3.19.4
+          # From https://get.helm.sh/helm-v3.19.4-linux-amd64.tar.gz.sha256sum
+          HELM_SHA256: 759c656fbd9c11e6a47784ecbeac6ad1eb16a9e76d202e51163ab78504848862
+        run: |
+          curl -fsSL -o helm.tar.gz "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz"
+          echo "${HELM_SHA256}  helm.tar.gz" | sha256sum -c -
+          tar -xzf helm.tar.gz linux-amd64/helm
+          sudo mv linux-amd64/helm /usr/local/bin/helm
+          helm version --short
+
+      - name: Check the charts
+        run: python3 scripts/check_charts.py --systems systems-repo

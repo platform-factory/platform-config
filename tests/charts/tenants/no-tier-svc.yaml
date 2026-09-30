@@ -1,0 +1,10 @@
+apiVersion: platform.thecloudgeek.io/v1alpha1
+kind: System
+metadata:
+  name: no-tier-svc
+spec:
+  owner:
+    team: team-a
+    repo: example-org/no-tier-svc
+  securityTier: internal
+  size: S
