@@ -39,9 +39,9 @@ What it checks
      (ADR-0017 §9).
   8. The root app-of-apps: the tenants' ApplicationSet keeps its guards
      (ADR-0019 §1); every source that reads this repo names the same revision
-     as environment.platformRevision, and on any branch but main that is not
-     main (ADR-0017 §12); the engine's service account is a reserved System
-     name.
+     as environment.platformRevision; on any branch but main that is not
+     main, and on main it is main (ADR-0017 §12); the engine's service
+     account is a reserved System name.
 
 How to run it
 -------------
@@ -387,7 +387,13 @@ def check_apps(environment, branch):
                 source["targetRevision"] == revision,
                 f"apps/{name} reads platform-config at {source['targetRevision']!r}, the same revision as environment.platformRevision ({revision!r})",
             )
-    if branch and branch != "main":
+    # Both directions. On a branch, a source that says main would render
+    # main's charts. On main, a source that still names the branch means the
+    # flip at merge was forgotten: everything keeps working until the branch
+    # is deleted, and then every Application breaks at once.
+    if branch == "main":
+        report(revision == "main", f"on main, every platform-config source says main, not {revision!r} (ADR-0017 §12: they flip in the PR that merges the branch)")
+    elif branch:
         report(revision != "main", f"on branch {branch!r}, no platform-config source says main (ADR-0017 §12)")
 
     configconnector = yaml.safe_load((REPO / "config-connector" / "configconnector.yaml").read_text())
@@ -421,7 +427,7 @@ def check_lint(systems, environment):
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("--systems", type=pathlib.Path, required=True, help="a checkout of platform-factory/systems")
-    parser.add_argument("--branch", help="the branch being checked (a PR's base branch); on any branch but main, no platform-config source may say main")
+    parser.add_argument("--branch", help="the branch being checked (a PR's base branch); on any branch but main, no platform-config source may say main, and on main every one must")
     args = parser.parse_args()
 
     version = subprocess.run([HELM, "version", "--short"], capture_output=True, text=True).stdout.strip()

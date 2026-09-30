@@ -60,5 +60,6 @@ environment:
   # (ADR-0017 §12). While the engine swap is being built and tested, it names
   # the M2b branch, so a build from the branch renders the branch's charts and
   # not main's. It flips to `main` in the same PR that merges the branch, and
-  # this repo's CI fails a branch whose platform-config sources say `main`.
+  # this repo's CI fails a branch whose platform-config sources say `main`,
+  # and fails a merge into `main` whose sources still name the branch.
   platformRevision: m2b-config-connector
