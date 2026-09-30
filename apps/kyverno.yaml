@@ -1,18 +1,19 @@
-# Kyverno — sync wave 2 of the root app-of-apps, alongside crossplane-platform.
+# Kyverno — sync wave 2 of the root app-of-apps.
 #
-# Why Kyverno is here at all (ADR-0014 §3): the XRD schema is the first and
-# cheapest gate, and it says no to anything it can express. Kyverno covers the
-# three things a schema cannot say — "only Crossplane creates raw managed
-# resources in a tenant namespace", "a System gets at most two Databases", and
-# (M3) the metadata spine pre-check. It is VALIDATE-ONLY. No mutating policy
+# Why Kyverno is here at all (ADR-0014 §3, ADR-0017 §6-§7): the charts'
+# schemas are the first and cheapest gate, and they say no to anything they
+# can express. Kyverno covers what a schema cannot see, because it happens with
+# kubectl rather than through git: "only Argo CD and Config Connector write
+# cloud objects in a tenant namespace", "nobody removes a durable object's
+# abandon annotation", and (M3) the metadata spine pre-check. It is VALIDATE-ONLY. No mutating policy
 # exists here, and none should: a mutation rewrites the object after Argo CD
 # applied it, so Argo's next diff sees a cluster that no longer matches git and
 # reports permanent drift. Validate-only keeps `ServerSideDiff` unnecessary and
 # keeps "OutOfSync" meaning what it says.
 #
 # The chart is vendored in this repo (charts/kyverno: upstream 3.9.1, app
-# v1.19.1, unmodified — see charts/README.md), for the same reason the
-# crossplane chart is: the repo-server's only allowed internet egress is git to
+# v1.19.1, unmodified — see charts/README.md), for the same reason every
+# vendored chart is: the repo-server's only allowed internet egress is git to
 # GitHub (C-23, ADR-0010), and a chart repository would be a second one. Chart
 # 3.9.1 declares five dependencies, three of them from external Helm repos, but
 # all five subcharts ship INSIDE the tarball (charts/kyverno/charts/), and Argo
@@ -30,7 +31,7 @@ spec:
   project: default
   source:
     repoURL: https://github.com/platform-factory/platform-config
-    targetRevision: main
+    targetRevision: m2b-config-connector
     path: charts/kyverno
     helm:
       releaseName: kyverno
@@ -57,14 +58,13 @@ spec:
           # templates/admission-controller/clusterrole.yaml, read 2026-09-16)
           # and invalidates its discovery cache the moment a CRD appears.
           #
-          # That matters here specifically: the Database CRD does not exist
-          # when Kyverno installs — Crossplane generates it from the XRD in
-          # wave 3, the same wave as kyverno/policies. Without the watcher,
-          # Kyverno only rediscovers on its resync (global.resyncPeriod, 15m),
-          # so database-claim-budget would sit registered-but-unenforced for
-          # up to fifteen minutes after the XRD lands — long enough for the
-          # first tenant's claim to slip past and long enough to make the
-          # C-07(b) denial evidence unreproducible.
+          # That matters here specifically: Config Connector's CRDs are
+          # installed by its operator at runtime, after it sees the
+          # ConfigConnector object (wave 0), and the policies in wave 3 match
+          # those kinds by name. Without the watcher, Kyverno only rediscovers
+          # on its resync (global.resyncPeriod, 15m), so a policy could sit
+          # registered-but-unenforced for up to fifteen minutes — long enough
+          # to make C-28 (b)'s refusal evidence unreproducible.
           crdWatcher: true
         # Two values keys set `registry: ghcr.io` LITERALLY rather than leaving
         # it null (charts/kyverno/values.yaml lines 583 and 654), and the
@@ -104,9 +104,10 @@ spec:
           # not prune them. Delete this Application and
           # `kyverno-resource-validating-webhook-cfg` survives, still carrying
           # the `validate.kyverno.svc-fail` webhook that
-          # deny-raw-managed-resources registers at failurePolicy: Fail, with no
-          # backend to answer it — which blocks every managed-resource CREATE in
-          # the cluster, Crossplane's own composed resources included. That is
+          # deny-raw-cloud-resources registers at failurePolicy: Fail, with no
+          # backend to answer it — which blocks every create, update and
+          # delete of a gated Config Connector kind, Argo CD's and the
+          # engine's own included (ADR-0017, Consequences). That is
           # true whether this flag is on or off, because the Jobs never ran
           # either way. Removing Kyverno is a two-step operation:
           #
@@ -142,7 +143,7 @@ spec:
         # background, cleanup, reports), against a 3 x e2-standard-4 node pool.
         # All four stay enabled. reportsController in particular earns its
         # keep — PolicyReports are the only place a developer can read WHY
-        # something was flagged, which is exactly the C-07(b) evidence.
+        # something was flagged, which is exactly the C-28 (b) evidence.
   destination:
     server: https://kubernetes.default.svc
     namespace: kyverno
@@ -178,8 +179,7 @@ spec:
       # a rebuild on every Application being Synced, so cosmetic drift here
       # would fail every future C-02 cycle.
       - ServerSideDiff=true
-    # Backstop, not the ordering mechanism (that's the sync wave). Same
-    # rationale as apps/crossplane.yaml.
+    # Backstop, not the ordering mechanism (that's the sync wave).
     retry:
       limit: 10
       backoff:
