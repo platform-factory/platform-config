@@ -1,68 +1,106 @@
-# The tenants — sync wave 4 of the root app-of-apps, and the only child
-# Application whose source is a DIFFERENT repository.
+# The tenants — sync wave 4 of the root app-of-apps (ADR-0017 §3).
 #
-# WHY A SEPARATE REPO. ADR-0001: the repo boundary is the approval boundary.
-# Everything in platform-config is the platform team changing the platform;
-# `systems` is the platform team onboarding a tenant. Different reviewers,
-# different blast radius, different rate of change — so a different repo, and
-# claim C-05 ("one YAML per tenant") is measured in lines of exactly that repo.
+# One Application per file in the systems repo's tenants/, each rendering
+# charts/system with that file. Adding a tenant is still adding one file there
+# and nothing else (C-05, C-26). Under Crossplane this was an Application that
+# applied the files as `System` objects; from M2b the files are read as values
+# and this ApplicationSet does the fan-out.
 #
-# WAVE 4, after compositions (wave 3). A `System` is a kind that does not exist
-# until the XRD in wave 3 is Established. If this synced earlier, every tenant
-# file would fail with "no matches for kind System" — which the retry block
-# below would eventually recover from, but slowly and with a Degraded root in
-# between. The wave is the ordering; the retry is the backstop.
+# WHY SO MANY GUARDS ON ONE OBJECT. This ApplicationSet owns every tenant's
+# Application, and each of those owns its tenant's namespace. By default, two
+# ordinary merges would delete every tenant at once: one that removes or
+# renames this file, and one that renames `tenants/` in the systems repo
+# (ADR-0019, Context). The four settings below make every such merge delete
+# nothing, and platform-config's CI fails if any of them goes missing:
+#   1. applicationsSync: create-update — this controller creates and updates
+#      Applications but never deletes one. Offboarding a tenant is therefore
+#      two steps: the PR, then a person's `argocd app delete <name>-system`
+#      (ADR-0019 §1). Layer 3's Argo CD sets no controller-wide policy, so this
+#      field is honoured.
+#   2. Prune=false,Delete=false — the root Application does not prune this
+#      object when its file goes away, or delete it if the root is deleted; it
+#      reports OutOfSync, which cycle.sh reads as a failed build.
+#   3. its own resources finalizer — a `kubectl delete` of this object with the
+#      default background cascade leaves every Application in place.
+#   4. (in charts/system) Prune=false on each tenant Namespace, so a chart
+#      change that stopped rendering it cannot delete it.
+# A foreground delete of this object still cascades; that takes a cluster
+# admin choosing it.
 #
-# HEALTH. Argo CD 3.4.6 ships no built-in health check for
-# platform.thecloudgeek.io — its wildcard built-ins key off group suffixes
-# `*.crossplane.io` and `*.upbound.io`, and ours is neither. `3-argocd` adds a
-# Lua check for System and Database so that "Healthy" here means the XR reports
-# Ready, not merely that the object was created. Without it this Application
-# would go Healthy the instant the YAML applied and C-05's merge-to-usable
-# stopwatch would measure nothing.
+# HEALTH. An ApplicationSet's health reads its own conditions, not its
+# Applications' (ADR-0017, Consequences). A healthy `systems` does not mean the
+# tenants reconciled, which is why cycle.sh counts tenant Applications against
+# tenant files.
 apiVersion: argoproj.io/v1alpha1
-kind: Application
+kind: ApplicationSet
 metadata:
   name: systems
   namespace: argocd
   annotations:
     argocd.argoproj.io/sync-wave: "4"
+    argocd.argoproj.io/sync-options: Prune=false,Delete=false
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
 spec:
-  project: default
-  source:
-    repoURL: https://github.com/platform-factory/systems
-    targetRevision: main
-    # One file per tenant. Adding a tenant is adding a file here and nothing
-    # else — no change to this Application, no change to platform-config.
-    path: tenants
-  destination:
-    server: https://kubernetes.default.svc
-    # Systems are cluster-scoped, so this namespace is only Argo CD's required
-    # placeholder for the destination; nothing is created in `argocd` by this
-    # Application. The tenant namespaces are created by the Composition, which
-    # is why no CreateNamespace sync option appears here.
-    namespace: argocd
+  # Go templates, and a missing field is an error rather than an empty string.
+  # One malformed tenant file therefore stops generation for every tenant
+  # (ADR-0017 §3); with create-update, it changes and deletes nothing either.
+  goTemplate: true
+  goTemplateOptions: ["missingkey=error"]
+  generators:
+    - git:
+        repoURL: https://github.com/platform-factory/systems
+        revision: main
+        files:
+          # The default globbing matches *.yaml at any depth, so a file in a
+          # subfolder would become a tenant: tenants/ stays flat, and the
+          # systems repo's check enforces it.
+          - path: "tenants/*.yaml"
   syncPolicy:
-    automated:
-      prune: true
-      # selfHeal matters more here than anywhere else in this repo: it is what
-      # makes a hand-edited tenant — someone widening a quota with `kubectl
-      # edit` — revert to what the reviewed file says.
-      selfHeal: true
-      #
-      # PRUNE AND DURABLE RESOURCES. Deleting a tenant's file prunes its System
-      # XR, which deletes the namespace, the RBAC, the Argo project and the
-      # Google service account — but NOT the Artifact Registry repository or
-      # any database. Those are composed with management policies that omit
-      # Delete (ADR-0015 §1), so they are observed, created and updated by the
-      # platform and removed only by a human following the runbook in ADR-0015
-      # §5. That asymmetry is the point: a mistaken `git rm` costs a tenant its
-      # namespace, which is rebuildable, and never its data.
-    syncOptions:
-      - ServerSideApply=true
-    retry:
-      limit: 10
-      backoff:
-        duration: 15s
-        factor: 2
-        maxDuration: 5m
+    applicationsSync: create-update
+  template:
+    metadata:
+      # Not the bare name: charts/system emits the tenant's own Application as
+      # <name>, and an Application that rendered one of its own name would
+      # overwrite itself (ADR-0017 §3).
+      name: "{{ .metadata.name }}-system"
+      namespace: argocd
+      labels:
+        platform.thecloudgeek.io/system: "{{ .metadata.name }}"
+    spec:
+      # The platform's project. The wall between tenant and platform is the
+      # tenant's own project, which charts/system writes (ADR-0017 §3).
+      project: default
+      sources:
+        # The chart, and this repository as a value source ($platform), both
+        # at the M2b branch until it merges (ADR-0017 §12).
+        - repoURL: https://github.com/platform-factory/platform-config
+          targetRevision: m2b-config-connector
+          path: charts/system
+          ref: platform
+          helm:
+            # In this order, the last one winning: the tenant file, the
+            # retired list, then the environment's facts, which no tenant
+            # file can replace (ADR-0017 §3, §9).
+            valueFiles:
+              - "$systems/{{ .path.path }}/{{ .path.filename }}"
+              - $systems/retired.yaml
+              - $platform/environments/reference.yaml
+        - repoURL: https://github.com/platform-factory/systems
+          targetRevision: main
+          ref: systems
+      destination:
+        server: https://kubernetes.default.svc
+        namespace: "{{ .metadata.name }}"
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+        syncOptions:
+          - ServerSideApply=true
+        retry:
+          limit: 10
+          backoff:
+            duration: 15s
+            factor: 2
+            maxDuration: 5m

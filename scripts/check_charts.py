@@ -37,6 +37,11 @@ What it checks
   7. svc-hello's database renders what is live on svc-hello-main, field by
      field, so the engine's first update does not change the instance
      (ADR-0017 §9).
+  8. The root app-of-apps: the tenants' ApplicationSet keeps its guards
+     (ADR-0019 §1); every source that reads this repo names the same revision
+     as environment.platformRevision; on any branch but main that is not
+     main, and on main it is main (ADR-0017 §12); the engine's service
+     account is a reserved System name.
 
 How to run it
 -------------
@@ -351,6 +356,54 @@ def check_svc_hello_matches_live(systems, environment):
         report(rendered == live, f"  svc-hello-main {field}: rendered {rendered!r}, live {live!r}")
 
 
+def platform_config_sources(document):
+    """Every source in an Application or ApplicationSet that reads this repo."""
+    spec = document["spec"]
+    if document["kind"] == "ApplicationSet":
+        spec = spec["template"]["spec"]
+    sources = spec.get("sources") or [spec["source"]]
+    return [s for s in sources if s["repoURL"].rstrip("/").endswith("/platform-config")]
+
+
+def check_apps(environment, branch):
+    """The root app-of-apps: the ApplicationSet's guards (ADR-0019 §1), one
+    revision for every read of this repo (ADR-0017 §12), and the engine's
+    service account."""
+    apps = {p.name: yaml.safe_load(p.read_text()) for p in sorted((REPO / "apps").glob("*.yaml"))}
+    revision = environment["environment"]["platformRevision"]
+
+    appset = apps.get("systems.yaml", {})
+    annotations = appset.get("metadata", {}).get("annotations", {})
+    sync_options = {o.strip() for o in annotations.get("argocd.argoproj.io/sync-options", "").split(",")}
+    report(appset.get("kind") == "ApplicationSet", "apps/systems.yaml is the tenants' ApplicationSet")
+    report(appset.get("spec", {}).get("syncPolicy", {}).get("applicationsSync") == "create-update", "  it never deletes an Application (applicationsSync: create-update)")
+    report({"Prune=false", "Delete=false"} <= sync_options, "  git cannot prune or delete it (Prune=false,Delete=false)")
+    report("resources-finalizer.argocd.argoproj.io" in appset.get("metadata", {}).get("finalizers", []), "  a background kubectl delete keeps its Applications (its own finalizer)")
+    report("missingkey=error" in appset.get("spec", {}).get("goTemplateOptions", []), "  a missing field is an error (missingkey=error)")
+
+    for name, document in apps.items():
+        for source in platform_config_sources(document):
+            report(
+                source["targetRevision"] == revision,
+                f"apps/{name} reads platform-config at {source['targetRevision']!r}, the same revision as environment.platformRevision ({revision!r})",
+            )
+    # Both directions. On a branch, a source that says main would render
+    # main's charts. On main, a source that still names the branch means the
+    # flip at merge was forgotten: everything keeps working until the branch
+    # is deleted, and then every Application breaks at once.
+    if branch == "main":
+        report(revision == "main", f"on main, every platform-config source says main, not {revision!r} (ADR-0017 §12: they flip in the PR that merges the branch)")
+    elif branch:
+        report(revision != "main", f"on branch {branch!r}, no platform-config source says main (ADR-0017 §12)")
+
+    configconnector = yaml.safe_load((REPO / "config-connector" / "configconnector.yaml").read_text())
+    engine = configconnector["spec"]["googleServiceAccount"]
+    project = environment["environment"]["projectID"]
+    report(engine == f"config-connector@{project}.iam.gserviceaccount.com", f"the engine's service account is config-connector in {project}")
+    reserved = json.loads((CHARTS / "system" / "values.schema.json").read_text())["$defs"]["systemName"]["allOf"][2]["not"]["enum"]
+    report(engine.split("@")[0] in reserved, "  and its name is a reserved System name")
+
+
 def check_lint(systems, environment):
     """helm lint, only with real value files (ADR-0017 §6). Not the gate."""
     tenant = yaml.safe_load((systems / "tenants" / "svc-hello.yaml").read_text())
@@ -374,6 +427,7 @@ def check_lint(systems, environment):
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("--systems", type=pathlib.Path, required=True, help="a checkout of platform-factory/systems")
+    parser.add_argument("--branch", help="the branch being checked (a PR's base branch); on any branch but main, no platform-config source may say main, and on main every one must")
     args = parser.parse_args()
 
     version = subprocess.run([HELM, "version", "--short"], capture_output=True, text=True).stdout.strip()
@@ -393,6 +447,8 @@ def main():
     check_real_tenants(args.systems, environment)
     print("\n== svc-hello's database renders what is live")
     check_svc_hello_matches_live(args.systems, environment)
+    print("\n== the root app-of-apps")
+    check_apps(environment, args.branch)
     print("\n== helm lint, with real value files")
     check_lint(args.systems, environment)
 
