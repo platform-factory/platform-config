@@ -42,6 +42,9 @@ What it checks
      as environment.platformRevision; on any branch but main that is not
      main, and on main it is main (ADR-0017 §12); the engine's service
      account is a reserved System name.
+  9. The reality gate refuses an edit as well as a create and a delete:
+     every Kyverno rule whose deny has no conditions sets
+     allowExistingViolations to false (ADR-0017 §7).
 
 How to run it
 -------------
@@ -404,6 +407,29 @@ def check_apps(environment, branch):
     report(engine.split("@")[0] in reserved, "  and its name is a reserved System name")
 
 
+def check_policies():
+    """The reality gate refuses an edit too (ADR-0017 §7).
+
+    On an update Kyverno judges the object twice: as asked for, and as it
+    was. With allowExistingViolations on, which is its default, an update
+    that was "already refused before" counts as nothing new and is let
+    through. A deny with no conditions refuses every object it matches, so
+    with the default every update is let through. The 2026-10-06 rehearsal
+    found a team member's kubectl edit of a database admitted that way."""
+    for path in sorted((REPO / "kyverno" / "policies").glob("*.yaml")):
+        policy = yaml.safe_load(path.read_text())
+        for rule in policy["spec"]["rules"]:
+            validate = rule.get("validate") or {}
+            if "deny" not in validate:
+                continue
+            unconditional = not (validate["deny"] or {}).get("conditions")
+            if unconditional:
+                report(
+                    validate.get("allowExistingViolations") is False,
+                    f"kyverno/policies/{path.name}, rule {rule['name']}: its deny has no conditions, so it says allowExistingViolations: false and an edit is refused like a create",
+                )
+
+
 def check_lint(systems, environment):
     """helm lint, only with real value files (ADR-0017 §6). Not the gate."""
     tenant = yaml.safe_load((systems / "tenants" / "svc-hello.yaml").read_text())
@@ -449,6 +475,8 @@ def main():
     check_svc_hello_matches_live(args.systems, environment)
     print("\n== the root app-of-apps")
     check_apps(environment, args.branch)
+    print("\n== the reality gate refuses an edit too")
+    check_policies()
     print("\n== helm lint, with real value files")
     check_lint(args.systems, environment)
 
