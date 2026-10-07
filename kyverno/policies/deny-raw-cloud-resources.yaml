@@ -98,7 +98,14 @@ spec:
                 namespace: cnrm-system
       validate:
         failureAction: Enforce
-        allowExistingViolations: true
+        # false, and it matters. On an update Kyverno judges the object twice:
+        # as asked for, and as it was. With this left on (its default), an
+        # update that "was already refused before" is let through as nothing
+        # new, and a deny with no conditions refuses every object, so EVERY
+        # update was let through. The 2026-10-06 rehearsal found a team
+        # member's kubectl edit of a database admitted that way, while create
+        # and delete were refused. scripts/check_charts.py now checks it.
+        allowExistingViolations: false
         message: >-
           Cloud resources are not made by hand here. Ask for a database in your
           service repo's claims.yaml, and the platform's chart creates the Cloud
@@ -153,7 +160,9 @@ spec:
                 namespace: kube-system
       validate:
         failureAction: Enforce
-        allowExistingViolations: true
+        # A delete is not an update, so this never let one through; false for
+        # the same reading as the rule above, and so the check has no exception.
+        allowExistingViolations: false
         message: >-
           Cloud resources are not deleted by hand here. To remove a database,
           take its entry out of your service repo's claims.yaml; the cloud
