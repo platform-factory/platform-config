@@ -46,10 +46,15 @@ spec:
 #
 # Not conditioned per System: Config Connector refuses a condition on an
 # Artifact Registry member (ADR-0017 §10).
+#
+# C-27, TEMPORARY: the naming rule is broken on purpose for svc-hello's
+# registry writer only. Its name no longer carries the team, so the next team
+# move edits this member in place, which ADR-0017 §10 predicts fails loudly.
+# The PR after the test restores the line below to the rule.
 apiVersion: iam.cnrm.cloud.google.com/v1beta1
 kind: IAMPolicyMember
 metadata:
-  name: {{ printf "%s-registry-writer-%s" $name $team }}
+  name: {{ ternary (printf "%s-registry-writer" $name) (printf "%s-registry-writer-%s" $name $team) (eq $name "svc-hello") }}
   namespace: {{ $name }}
   labels:
     {{- include "system.labels" . | nindent 4 }}
