@@ -96,6 +96,17 @@ spec:
               - kind: ServiceAccount
                 name: cnrm-deletiondefender
                 namespace: cnrm-system
+              # The garbage collector finishes every delete Argo CD makes.
+              # Argo CD prunes in the foreground, which puts a
+              # foregroundDeletion finalizer on the object, and the garbage
+              # collector removes it with an UPDATE once nothing depends on the
+              # object. It only ever edits an object's metadata. Refusing it
+              # left every pruned object stuck terminating after its cloud
+              # resource was gone; M2b Session A (2026-10-19) found four, on the
+              # first team move. GKE presents it under this upstream name.
+              - kind: ServiceAccount
+                name: generic-garbage-collector
+                namespace: kube-system
       validate:
         failureAction: Enforce
         # false, and it matters. On an update Kyverno judges the object twice:
