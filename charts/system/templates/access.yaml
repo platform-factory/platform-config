@@ -1,0 +1,87 @@
+{{- $name := .Values.metadata.name }}
+{{- $project := include "system.env" (list .Values "projectID") }}
+{{- $group := printf "%s@%s" .Values.spec.owner.team (include "system.env" (list .Values "orgDomain")) }}
+---
+# The team's access to its namespace: Kubernetes' built-in `admin` role, for
+# the team's Google Group, in this namespace only.
+#
+# GKE resolves the group because the cluster was created pointing at
+# gke-security-groups@<orgDomain> and the team group is nested inside it, a
+# Workspace prerequisite the platform does not create. Group names in RBAC are
+# case-sensitive; the schema keeps team names lowercase.
+#
+# `admin` now also carries Config Connector's kinds: its `cnrm-admin` role
+# aggregates into `admin` (ADR-0017 §7). So a team member could create, edit
+# or delete cloud objects here with kubectl. Kyverno's reality gate refuses
+# exactly that, for everyone except Argo CD and Config Connector itself.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $name }}-admin
+  namespace: {{ $name }}
+  labels:
+    {{- include "system.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: admin
+subjects:
+  # Moves in place on a team change: a RoleBinding's subjects can be edited.
+  - apiGroup: rbac.authorization.k8s.io
+    kind: Group
+    name: {{ $group | quote }}
+---
+# The System's Kubernetes identity. A pod that sets
+# `serviceAccountName: {{ $name }}` is, to Google, the System's service account:
+# no key, no secret, nothing in git. Both halves of Workload Identity are
+# needed: this annotation, and the binding in identity.yaml.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $name }}
+  namespace: {{ $name }}
+  labels:
+    {{- include "system.labels" . | nindent 4 }}
+  annotations:
+    iam.gke.io/gcp-service-account: {{ printf "%s@%s.iam.gserviceaccount.com" $name $project | quote }}
+---
+# The identity charts/claims' seed Job runs as. It may read and create Secrets
+# in this namespace and nothing else, which is what creating a database's
+# <claim>-admin Secret once takes. It lives here rather than in charts/claims
+# so that the claims chart emits nothing that does not belong to a claim
+# (ADR-0019 §2).
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: database-seed
+  namespace: {{ $name }}
+  labels:
+    {{- include "system.labels" . | nindent 4 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: database-seed
+  namespace: {{ $name }}
+  labels:
+    {{- include "system.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: database-seed
+  namespace: {{ $name }}
+  labels:
+    {{- include "system.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: database-seed
+subjects:
+  - kind: ServiceAccount
+    name: database-seed
+    namespace: {{ $name }}

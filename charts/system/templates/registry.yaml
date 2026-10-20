@@ -1,0 +1,63 @@
+{{- $name := .Values.metadata.name }}
+{{- $team := .Values.spec.owner.team }}
+{{- $project := include "system.env" (list .Values "projectID") }}
+{{- $group := printf "%s@%s" $team (include "system.env" (list .Values "orgDomain")) }}
+---
+# The System's container registry (ADR-0010 image plane, ADR-0012 §1).
+#
+# DURABLE (ADR-0015 §1). When Argo CD prunes this object, the abandon
+# annotation makes Config Connector let go of the repository instead of
+# deleting it and its images, and a Kyverno rule keeps anyone from removing
+# the annotation (ADR-0017 §9). This kind has no deletionPolicy field of its
+# own. From ADR-0018's narrowing on, the engine also has no permission to
+# delete a repository. Deleting one is a person's step (ADR-0015 §5).
+#
+# Adoption is by name: on a rebuild, Config Connector finds the repository
+# named after the System and takes it over.
+apiVersion: artifactregistry.cnrm.cloud.google.com/v1beta1
+kind: ArtifactRegistryRepository
+metadata:
+  name: {{ $name }}
+  namespace: {{ $name }}
+  labels:
+    {{- include "system.labels" . | nindent 4 }}
+    # Cloud labels: Config Connector copies metadata.labels to the repository
+    # and drops every key containing "/" (ADR-0017 §8). These are the same
+    # four facts, in the alphabet Google allows, and `system` is how ADR-0015's
+    # orphan runbook and C-32's cost split find the repository.
+    system: {{ $name | quote }}
+    team: {{ $team | quote }}
+    tier: {{ include "system.tier" . | quote }}
+    security-tier: {{ .Values.spec.securityTier | quote }}
+  annotations:
+    {{- include "system.cnrmAnnotations" $project | nindent 4 }}
+    cnrm.cloud.google.com/deletion-policy: abandon
+spec:
+  resourceID: {{ $name }}
+  # The registry's own location, which is part of its hostname; not
+  # necessarily the region the workloads run in.
+  location: {{ include "system.env" (list .Values "registryLocation") | quote }}
+  format: DOCKER
+  description: {{ printf "Images for System %s (team %s)" $name $team | quote }}
+---
+# The team may push to its own registry: roles/artifactregistry.writer, push
+# and pull, not repository or IAM management. The team is in the name because
+# an IAM member's fields cannot change (see identity.yaml).
+#
+# Not conditioned per System: Config Connector refuses a condition on an
+# Artifact Registry member (ADR-0017 §10).
+apiVersion: iam.cnrm.cloud.google.com/v1beta1
+kind: IAMPolicyMember
+metadata:
+  name: {{ printf "%s-registry-writer-%s" $name $team }}
+  namespace: {{ $name }}
+  labels:
+    {{- include "system.labels" . | nindent 4 }}
+  annotations:
+    {{- include "system.cnrmAnnotations" $project | nindent 4 }}
+spec:
+  resourceRef:
+    kind: ArtifactRegistryRepository
+    name: {{ $name }}
+  role: roles/artifactregistry.writer
+  member: {{ printf "group:%s" $group | quote }}

@@ -1,0 +1,11 @@
+apiVersion: platform.thecloudgeek.io/v1alpha1
+kind: System
+metadata:
+  name: critical-svc
+spec:
+  owner:
+    team: team-a
+    repo: example-org/critical-svc
+  tier: critical
+  securityTier: internal
+  size: S

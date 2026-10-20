@@ -1,0 +1,10 @@
+# Deliberately empty.
+#
+# A chart's values.yaml is a value layer beneath every other, so a key left
+# here would quietly fill in one that a real input forgot (ADR-0017 §6). This
+# chart's inputs arrive from exactly two places:
+#   - the service's claims.yaml (`databases:`), as a value file;
+#   - the platform's facts (`system:` and `environment:`), which charts/system
+#     writes into this Application's `helm.valuesObject`, above every value
+#     file (ADR-0017 §4).
+# values.schema.json checks the merged result and refuses anything else.

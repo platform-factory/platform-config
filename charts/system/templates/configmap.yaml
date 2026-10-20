@@ -1,0 +1,30 @@
+{{- $name := .Values.metadata.name }}
+{{- $project := include "system.env" (list .Values "projectID") }}
+---
+# The tenant's own copy of the facts, for people and for tooling.
+# `kubectl get configmap platform-system -o yaml` answers "which registry do I
+# push to, which Google identity am I, which group owns this" without a
+# platform engineer. A fixed name, so a script or a CI job can find it without
+# knowing the namespace. It replaces the Crossplane recipe's status document:
+# every fact here is known when the chart renders (ADR-0017 §8).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: platform-system
+  namespace: {{ $name }}
+  labels:
+    {{- include "system.labels" . | nindent 4 }}
+  annotations:
+    platform.thecloudgeek.io/repo: {{ .Values.spec.owner.repo | quote }}
+data:
+  system: {{ $name | quote }}
+  team: {{ .Values.spec.owner.team | quote }}
+  group: {{ printf "%s@%s" .Values.spec.owner.team (include "system.env" (list .Values "orgDomain")) | quote }}
+  gsaEmail: {{ printf "%s@%s.iam.gserviceaccount.com" $name $project | quote }}
+  registry: {{ printf "%s/%s" (include "system.env" (list .Values "registryBase")) $name | quote }}
+  repo: {{ .Values.spec.owner.repo | quote }}
+  tier: {{ include "system.tier" . | quote }}
+  securityTier: {{ .Values.spec.securityTier | quote }}
+  size: {{ .Values.spec.size | quote }}
+  project: {{ $project | quote }}
+  region: {{ include "system.env" (list .Values "region") | quote }}

@@ -1,0 +1,4 @@
+# Python writes these when scripts/check_charts.py is imported rather than
+# run. They are build output, and they embed the path they were built at.
+__pycache__/
+*.pyc

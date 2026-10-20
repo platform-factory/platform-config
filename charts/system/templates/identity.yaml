@@ -1,0 +1,91 @@
+{{- $name := .Values.metadata.name }}
+{{- $team := .Values.spec.owner.team }}
+{{- $project := include "system.env" (list .Values "projectID") }}
+{{- $group := printf "%s@%s" $team (include "system.env" (list .Values "orgDomain")) }}
+{{- $gsa := printf "%s@%s.iam.gserviceaccount.com" $name $project }}
+---
+# The System's Google identity (ADR-0013 §1). Not durable: it goes when the
+# System goes, and ADR-0018 leaves the engine permission to delete it.
+apiVersion: iam.cnrm.cloud.google.com/v1beta1
+kind: IAMServiceAccount
+metadata:
+  name: {{ $name }}
+  namespace: {{ $name }}
+  labels:
+    {{- include "system.labels" . | nindent 4 }}
+  annotations:
+    {{- include "system.cnrmAnnotations" $project | nindent 4 }}
+spec:
+  # The account's ID in Google: <system>@<project>.iam.gserviceaccount.com.
+  resourceID: {{ $name }}
+  displayName: {{ printf "System %s" $name | quote }}
+  description: {{ printf "Workload identity for System %s. Rendered by the platform; do not edit by hand." $name | quote }}
+---
+# Workload Identity: the Kubernetes service account in access.yaml may act as
+# the Google one. The pool is always <project>.svc.id.goog.
+apiVersion: iam.cnrm.cloud.google.com/v1beta1
+kind: IAMPolicyMember
+metadata:
+  name: {{ $name }}-workload-identity
+  namespace: {{ $name }}
+  labels:
+    {{- include "system.labels" . | nindent 4 }}
+  annotations:
+    {{- include "system.cnrmAnnotations" $project | nindent 4 }}
+spec:
+  resourceRef:
+    kind: IAMServiceAccount
+    name: {{ $name }}
+  role: roles/iam.workloadIdentityUser
+  member: {{ printf "serviceAccount:%s.svc.id.goog[%s/%s]" $project $name $name | quote }}
+{{- /*
+Cloud SQL login grants (ADR-0013 §1 and §5): two roles for two principals.
+  roles/cloudsql.client        connect, through the Auth Proxy
+  roles/cloudsql.instanceUser  log in as an IAM database user
+The System's service account is how the application connects; the team's
+group is how a person does. Both roles can be granted no lower than the
+project, and are harmless without a database user.
+
+An IAM member's fields cannot change, and the API server refuses an edit
+(ADR-0017 §10). So a member whose principal can change, the team's, has the
+team in its NAME: a team move renders three new members (these two and the
+registry writer) and Argo CD prunes the three old ones.
+
+Not yet under the per-System IAM Condition of C-24; that ships in M3 with
+exact instance names (ADR-0017 §10).
+*/}}
+{{- $roles := dict "sql-client" "roles/cloudsql.client" "sql-instance-user" "roles/cloudsql.instanceUser" }}
+{{- range $roleName, $role := $roles }}
+---
+apiVersion: iam.cnrm.cloud.google.com/v1beta1
+kind: IAMPolicyMember
+metadata:
+  name: {{ printf "%s-%s-app" $name $roleName }}
+  namespace: {{ $name }}
+  labels:
+    {{- include "system.labels" $ | nindent 4 }}
+  annotations:
+    {{- include "system.cnrmAnnotations" $project | nindent 4 }}
+spec:
+  resourceRef:
+    kind: Project
+    external: {{ printf "projects/%s" $project | quote }}
+  role: {{ $role }}
+  member: {{ printf "serviceAccount:%s" $gsa | quote }}
+---
+apiVersion: iam.cnrm.cloud.google.com/v1beta1
+kind: IAMPolicyMember
+metadata:
+  name: {{ printf "%s-%s-team-%s" $name $roleName $team }}
+  namespace: {{ $name }}
+  labels:
+    {{- include "system.labels" $ | nindent 4 }}
+  annotations:
+    {{- include "system.cnrmAnnotations" $project | nindent 4 }}
+spec:
+  resourceRef:
+    kind: Project
+    external: {{ printf "projects/%s" $project | quote }}
+  role: {{ $role }}
+  member: {{ printf "group:%s" $group | quote }}
+{{- end }}

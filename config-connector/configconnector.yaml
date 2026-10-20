@@ -1,0 +1,33 @@
+# The one object that turns Config Connector on (ADR-0017 §1).
+#
+# Cluster mode: one controller, acting as one Google service account for every
+# namespace, the same posture as Crossplane's single provider identity.
+# Namespaced mode, one identity per tenant namespace, is the tighter design and
+# is deferred for the reason ADR-0017 §1 gives.
+#
+# The service account is created by platform-bootstrap's layer 0, with one
+# Workload Identity binding for
+#   serviceAccount:<project>.svc.id.goog[cnrm-system/cnrm-controller-manager]
+# Its permissions live in the platform-roles repo (ADR-0018), never here: an
+# identity that can edit custom roles can grant itself anything. Its name,
+# `config-connector`, is also a reserved System name in charts/system, because
+# a System of that name would adopt this account by name.
+#
+# stateIntoSpec: Absent, cluster-wide. Each object the charts render also
+# carries the per-object annotation; either alone would do, and neither can be
+# changed on a live object (ADR-0017 §8).
+apiVersion: core.cnrm.cloud.google.com/v1beta1
+kind: ConfigConnector
+metadata:
+  # The operator reconciles exactly one object, with exactly this name.
+  name: configconnector.core.cnrm.cloud.google.com
+  annotations:
+    # After the operator manifest in the same Application, whose CRD defines
+    # this kind; the dry run is skipped for the one sync where the CRD does not
+    # exist yet.
+    argocd.argoproj.io/sync-wave: "1"
+    argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true
+spec:
+  mode: cluster
+  googleServiceAccount: config-connector@platform-factory-ref.iam.gserviceaccount.com
+  stateIntoSpec: Absent

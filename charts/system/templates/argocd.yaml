@@ -1,0 +1,147 @@
+{{- $name := .Values.metadata.name }}
+{{- $team := .Values.spec.owner.team }}
+{{- $group := printf "%s@%s" $team (include "system.env" (list .Values "orgDomain")) }}
+{{- $repoURL := printf "%s/%s" (include "system.env" (list .Values "gitBase")) .Values.spec.owner.repo }}
+---
+# The tenant's Argo CD project: the git-side wall between a tenant and the
+# platform (ADR-0017 §3). A tenant's Application may sync only from its own
+# repo, only into its own namespace, and only kinds this project permits.
+#
+# Two schema traps (argo-cd v3.4.6 app_project_types.go):
+#   - namespaceResourceWhitelist absent means every namespaced kind is
+#     allowed; written as [] it means none. It is absent, and the blacklist
+#     below draws the line.
+#   - clusterResourceWhitelist absent means no cluster-scoped kind is allowed,
+#     which is the tenant boundary. Also absent, on purpose.
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: {{ $name }}
+  namespace: argocd
+  labels:
+    {{- include "system.labels" . | nindent 4 }}
+  annotations:
+    platform.thecloudgeek.io/repo: {{ .Values.spec.owner.repo | quote }}
+spec:
+  description: {{ printf "System %s, owned by %s. Rendered by the platform's charts/system; edits here are overwritten." $name $team | quote }}
+  sourceRepos:
+    - {{ $repoURL | quote }}
+  destinations:
+    - server: https://kubernetes.default.svc
+      namespace: {{ $name }}
+  namespaceResourceBlacklist:
+    # Cloud resources come only from the platform's claims chart, never from a
+    # tenant's own manifests. The blacklist matches group globs (ADR-0017 §4).
+    - group: "*.cnrm.cloud.google.com"
+      kind: "*"
+    # A tenant has no use for an Application, AppProject or ApplicationSet of
+    # its own. With this entry, one placed in its k8s/ is refused by name
+    # (ADR-0017 §4). Argo Rollouts shares this group; it is not installed.
+    - group: "argoproj.io"
+      kind: "*"
+    # Access is granted by the platform, never self-granted: without this, a
+    # tenant could bind its own service account to any role the API server
+    # allows.
+    - group: "rbac.authorization.k8s.io"
+      kind: "*"
+    # The size class is a System field; a tenant raising its own quota would
+    # make it a suggestion.
+    - group: ""
+      kind: ResourceQuota
+    - group: ""
+      kind: LimitRange
+    # A tenant cannot write its own policy exceptions.
+    - group: "kyverno.io"
+      kind: "*"
+  roles:
+    # Inert until Argo CD has single sign-on. Argo CD groups come from its own
+    # login's groups claim, not from GKE's Google Groups, and no login carries
+    # one yet, so this role grants nobody anything today.
+    - name: developer
+      description: {{ printf "%s: view and sync %s (inert until Argo CD SSO)." $group $name | quote }}
+      groups:
+        - {{ $group | quote }}
+      policies:
+        - {{ printf "p, proj:%s:developer, applications, get, %s/*, allow" $name $name | quote }}
+        - {{ printf "p, proj:%s:developer, applications, sync, %s/*, allow" $name $name | quote }}
+        - {{ printf "p, proj:%s:developer, logs, get, %s/*, allow" $name $name | quote }}
+---
+# The tenant's own Application: the service repo's k8s/ directory, synced into
+# the tenant's namespace under the project above.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: {{ $name }}
+  namespace: argocd
+  labels:
+    {{- include "system.labels" . | nindent 4 }}
+  annotations:
+    platform.thecloudgeek.io/repo: {{ .Values.spec.owner.repo | quote }}
+spec:
+  project: {{ $name }}
+  source:
+    repoURL: {{ $repoURL | quote }}
+    targetRevision: main
+    path: k8s
+    directory:
+      # TEMPORARY, for M2b only (ADR-0017 §12). svc-hello keeps its Crossplane
+      # claim, k8s/database.yaml, beside claims.yaml so that a rollback to
+      # Crossplane still has one to read. This engine has no such kind, so the
+      # file is skipped here. It goes when M2b closes and the file is deleted.
+      exclude: "database.yaml"
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: {{ $name }}
+  syncPolicy:
+    {{- include "system.syncPolicy" . | nindent 4 }}
+---
+# The tenant's claims, and the place the form is enforced (ADR-0017 §4).
+#
+# It belongs to the platform's project and renders the platform's
+# charts/claims. The service supplies exactly one value file, claims.yaml,
+# read from its repo through a `ref` source that renders nothing. Everything
+# else, the platform writes into `valuesObject` below, which outranks every
+# value file; and because Helm merges key by key, it writes EVERY key of
+# `system` and `environment`, leaving none for a claims.yaml to fill.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: {{ $name }}-claims
+  namespace: argocd
+  labels:
+    {{- include "system.labels" . | nindent 4 }}
+spec:
+  project: default
+  sources:
+    - repoURL: {{ include "system.env" (list .Values "platformConfigRepo") | quote }}
+      # platformRevision names the M2b branch while the engine swap is being
+      # built, and main after it merges (ADR-0017 §12).
+      targetRevision: {{ include "system.env" (list .Values "platformRevision") | quote }}
+      path: charts/claims
+      helm:
+        # Every name the claims chart builds comes from the release namespace,
+        # which no value file can change (ADR-0017 §4).
+        namespace: {{ $name }}
+        valueFiles:
+          - $tenant/claims.yaml
+        # A service with no databases has no claims.yaml, and renders nothing.
+        # Two limits (ADR-0017 §4): it forgives a missing file, not a missing
+        # repository or branch; and it skips in silence, so a misnamed
+        # claims.yml renders nothing too. Nothing is deleted then either:
+        # Argo CD refuses to prune an Application to empty (ADR-0019 §2).
+        ignoreMissingValueFiles: true
+        valuesObject:
+          system:
+            name: {{ $name | quote }}
+            team: {{ $team | quote }}
+            tier: {{ include "system.tier" . | quote }}
+          environment:
+            {{- .Values.environment | toYaml | nindent 12 }}
+    - repoURL: {{ $repoURL | quote }}
+      targetRevision: main
+      ref: tenant
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: {{ $name }}
+  syncPolicy:
+    {{- include "system.syncPolicy" . | nindent 4 }}

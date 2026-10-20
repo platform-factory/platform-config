@@ -1,0 +1,8 @@
+apiVersion: v2
+name: system
+description: >-
+  Everything one tenant gets, from its file in the systems repo: a namespace,
+  its quota and access, its Argo CD project and Applications, its Google
+  identity and grants, and its image registry (ADR-0012, ADR-0017).
+type: application
+version: 0.1.0

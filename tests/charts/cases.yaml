@@ -1,0 +1,172 @@
+# Inputs the charts must refuse, and inputs they must render.
+# Run by scripts/check_charts.py, locally and in CI (ADR-0019 §4: a check is
+# evidence only once it has been seen to fail).
+#
+# Each case names:
+#   chart:     system or claims
+#   tenant:    a file under tests/charts/tenants/ (or, for a system case,
+#              `tenant_file:` inline, to test a bad tenant file)
+#   claims:    the service's claims.yaml, inline (claims cases only; leave it
+#              out for a service with no claims.yaml)
+#   retired:   the retired list (default: empty)
+#   namespace: the release namespace (default: the tenant's name)
+#   expect:    must-fail only. Text the refusal must contain, so a case that
+#              fails for the WRONG reason is caught too.
+#
+# A claims case is rendered the way Argo CD renders it: charts/system first,
+# with the tenant file, the retired list and the real environment file; then
+# charts/claims with claims.yaml followed by the valuesObject charts/system
+# wrote, which wins, as it does under Argo CD (ADR-0017 §4).
+
+must_fail:
+
+  # ---- charts/system: System names (ADR-0017 §6, §9) ----------------------
+  - name: system name ends in -claims
+    chart: system
+    tenant_file: {metadata: {name: orders-claims}}
+    expect: "at '/metadata/name': 'allOf' failed"
+  - name: system name ends in -system
+    chart: system
+    tenant_file: {metadata: {name: orders-system}}
+    expect: "at '/metadata/name': 'allOf' failed"
+  - name: system name is a platform namespace
+    chart: system
+    tenant_file: {metadata: {name: argocd}}
+    expect: "at '/metadata/name': 'allOf' failed"
+  - name: system name starts with a reserved prefix
+    chart: system
+    tenant_file: {metadata: {name: kube-tenant}}
+    expect: "at '/metadata/name': 'allOf' failed"
+  - name: system name is a platform service account
+    chart: system
+    tenant_file: {metadata: {name: jumpbox}}
+    expect: "at '/metadata/name': 'allOf' failed"
+  - name: system name is the engine's service account
+    chart: system
+    tenant_file: {metadata: {name: config-connector}}
+    expect: "at '/metadata/name': 'allOf' failed"
+  - name: system name is a registry remote
+    chart: system
+    tenant_file: {metadata: {name: quay-io}}
+    expect: "at '/metadata/name': 'allOf' failed"
+  - name: system name is on the retired list
+    chart: system
+    tenant: standard-svc
+    retired: [standard-svc]
+    expect: "is on systems/retired.yaml"
+  - name: tenant file has an unknown top-level key
+    chart: system
+    tenant_file: {extra: surprise}
+    expect: "additional properties 'extra' not allowed"
+  - name: tenant file has a size outside the enum
+    chart: system
+    tenant_file: {spec: {size: XL}}
+    expect: "at '/spec/size'"
+
+  # ---- charts/claims: the tenant boundary (ADR-0017 §5, §6; C-28 (b)) -----
+  - name: claim name contains a hyphen
+    chart: claims
+    tenant: standard-svc
+    claims: {databases: {api-main: {engine: POSTGRES_16, region: us-central1, size: S}}}
+    expect: "'api-main' does not match pattern"
+  - name: wrong region
+    chart: claims
+    tenant: standard-svc
+    claims: {databases: {main: {engine: POSTGRES_16, region: europe-west1, size: S}}}
+    expect: "at '/databases/main/region'"
+  - name: oversized request
+    chart: claims
+    tenant: standard-svc
+    claims: {databases: {main: {engine: POSTGRES_16, region: us-central1, size: XL}}}
+    expect: "at '/databases/main/size'"
+  - name: size L with claim tier standard
+    chart: claims
+    tenant: critical-svc
+    claims: {databases: {main: {engine: POSTGRES_16, region: us-central1, size: L, tier: standard}}}
+    expect: "at '/databases/main/tier': value must be 'critical'"
+  - name: size L with the claim's tier left out
+    chart: claims
+    tenant: critical-svc
+    claims: {databases: {main: {engine: POSTGRES_16, region: us-central1, size: L}}}
+    expect: "missing property 'tier'"
+  - name: size L tier critical in a standard-tier System
+    chart: claims
+    tenant: standard-svc
+    claims: {databases: {main: {engine: POSTGRES_16, region: us-central1, size: L, tier: critical}}}
+    expect: "at '/databases/main/size': 'not' failed"
+  - name: size L, claims.yaml promotes its own System (tenant file states standard)
+    chart: claims
+    tenant: standard-svc
+    claims: {system: {tier: critical}, databases: {main: {engine: POSTGRES_16, region: us-central1, size: L, tier: critical}}}
+    expect: "at '/databases/main/size': 'not' failed"
+  - name: size L, claims.yaml promotes its own System (tenant file leaves tier out)
+    chart: claims
+    tenant: no-tier-svc
+    claims: {system: {tier: critical}, databases: {main: {engine: POSTGRES_16, region: us-central1, size: L, tier: critical}}}
+    expect: "at '/databases/main/size': 'not' failed"
+  - name: backups off on size M
+    chart: claims
+    tenant: standard-svc
+    claims: {databases: {main: {engine: POSTGRES_16, region: us-central1, size: M, backups: false}}}
+    expect: "at '/databases/main/size': value must be 'S'"
+  - name: an extra key on a database
+    chart: claims
+    tenant: standard-svc
+    claims: {databases: {main: {engine: POSTGRES_16, region: us-central1, size: S, ipv4Enabled: true}}}
+    expect: "additional properties 'ipv4Enabled' not allowed"
+  - name: a string crafted to inject YAML
+    chart: claims
+    tenant: standard-svc
+    claims: {databases: {main: {engine: "POSTGRES_16\n  ipv4Enabled: true", region: us-central1, size: S}}}
+    expect: "at '/databases/main/engine'"
+  - name: over the per-System claim limit
+    chart: claims
+    tenant: standard-svc
+    claims:
+      databases:
+        one: {engine: POSTGRES_16, region: us-central1, size: S}
+        two: {engine: POSTGRES_16, region: us-central1, size: S}
+        three: {engine: POSTGRES_16, region: us-central1, size: S}
+    expect: "maxProperties"
+  - name: an unknown key under environment
+    chart: claims
+    tenant: standard-svc
+    claims: {environment: {surprise: value}, databases: {main: {engine: POSTGRES_16, region: us-central1, size: S}}}
+    expect: "additional properties 'surprise' not allowed"
+  - name: rendered into another System's namespace
+    chart: claims
+    tenant: standard-svc
+    namespace: another-svc
+    claims: {databases: {main: {engine: POSTGRES_16, region: us-central1, size: S}}}
+    expect: "only renders into its own System's namespace"
+
+must_pass:
+  - name: a standard System with one small database
+    chart: claims
+    tenant: standard-svc
+    claims: {databases: {main: {engine: POSTGRES_16, region: us-central1, size: S, tier: standard, backups: true}}}
+  - name: a critical System with a size-L database
+    chart: claims
+    tenant: critical-svc
+    claims: {databases: {main: {engine: POSTGRES_17, region: us-central1, size: L, tier: critical}}}
+  - name: backups off on size S
+    chart: claims
+    tenant: standard-svc
+    claims: {databases: {main: {engine: POSTGRES_16, region: us-central1, size: S, backups: false}}}
+  - name: two databases, at the limit
+    chart: claims
+    tenant: standard-svc
+    claims:
+      databases:
+        one: {engine: POSTGRES_16, region: us-central1, size: S}
+        two: {engine: POSTGRES_16, region: us-east1, size: M}
+  - name: a service with no claims.yaml
+    chart: claims
+    tenant: standard-svc
+  - name: a claims.yaml with no databases
+    chart: claims
+    tenant: standard-svc
+    claims: {databases: {}}
+  - name: a System that leaves its tier out
+    chart: system
+    tenant: no-tier-svc
