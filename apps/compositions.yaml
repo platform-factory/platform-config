@@ -41,7 +41,8 @@ spec:
   project: default
   source:
     repoURL: https://github.com/platform-factory/platform-config
-    targetRevision: main
+    # The long-lived Crossplane branch reads itself (ADR-0017 §12).
+    targetRevision: crossplane
     path: crossplane/compositions
     directory:
       # Each API gets its own subdirectory (system/, database/), so the sync

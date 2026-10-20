@@ -44,7 +44,8 @@ spec:
   project: default
   source:
     repoURL: https://github.com/platform-factory/platform-config
-    targetRevision: main
+    # The long-lived Crossplane branch reads itself (ADR-0017 §12).
+    targetRevision: crossplane
     path: crossplane/platform
   destination:
     server: https://kubernetes.default.svc
