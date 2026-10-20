@@ -16,7 +16,9 @@ spec:
   project: default
   source:
     repoURL: https://github.com/platform-factory/platform-config
-    targetRevision: main
+    # The long-lived Crossplane branch reads itself (ADR-0017 §12), so a
+    # rebuild from it is still Crossplane after main moves to the new engine.
+    targetRevision: crossplane
     path: charts/crossplane
     helm:
       releaseName: crossplane
