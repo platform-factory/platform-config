@@ -7,9 +7,10 @@
 # resource_customizations/_.cnrm.cloud.google.com/_/health.lua). By then the
 # operator has installed Config Connector's CRDs, so the next waves find them.
 #
-# On the M2b branch, targetRevision names the branch. It flips to main in the
-# PR that merges the branch (ADR-0017 §12); scripts/check_charts.py fails a
-# branch whose platform-config sources say main.
+# targetRevision is main. On the M2b branch it named the branch, and it
+# flipped in the PR that merged the branch (ADR-0017 §12); a rebuild on the
+# old engine is the `crossplane` branch. scripts/check_charts.py fails main
+# if a platform-config source names anything else.
 apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:
@@ -21,7 +22,7 @@ spec:
   project: default
   source:
     repoURL: https://github.com/platform-factory/platform-config
-    targetRevision: m2b-config-connector
+    targetRevision: main
     path: config-connector
   destination:
     server: https://kubernetes.default.svc

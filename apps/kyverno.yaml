@@ -31,7 +31,7 @@ spec:
   project: default
   source:
     repoURL: https://github.com/platform-factory/platform-config
-    targetRevision: m2b-config-connector
+    targetRevision: main
     path: charts/kyverno
     helm:
       releaseName: kyverno

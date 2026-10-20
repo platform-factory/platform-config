@@ -60,7 +60,7 @@ spec:
   project: default
   source:
     repoURL: https://github.com/platform-factory/platform-config
-    targetRevision: m2b-config-connector
+    targetRevision: main
     path: kyverno/policies
   destination:
     server: https://kubernetes.default.svc

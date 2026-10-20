@@ -73,9 +73,10 @@ spec:
       project: default
       sources:
         # The chart, and this repository as a value source ($platform), both
-        # at the M2b branch until it merges (ADR-0017 §12).
+        # at main, the same revision as environment.platformRevision
+        # (ADR-0017 §12).
         - repoURL: https://github.com/platform-factory/platform-config
-          targetRevision: m2b-config-connector
+          targetRevision: main
           path: charts/system
           ref: platform
           helm:

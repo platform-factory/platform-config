@@ -57,9 +57,8 @@ environment:
   platformConfigRepo: https://github.com/platform-factory/platform-config
 
   # The revision of THIS repository that every chart-emitted Application reads
-  # (ADR-0017 §12). While the engine swap is being built and tested, it names
-  # the M2b branch, so a build from the branch renders the branch's charts and
-  # not main's. It flips to `main` in the same PR that merges the branch, and
-  # this repo's CI fails a branch whose platform-config sources say `main`,
-  # and fails a merge into `main` whose sources still name the branch.
-  platformRevision: m2b-config-connector
+  # (ADR-0017 §12). While the engine swap was built and tested it named the
+  # M2b branch; it flipped to `main` in the PR that merged the branch. This
+  # repo's CI fails a branch whose platform-config sources say `main`, and
+  # fails `main` if a source names anything else.
+  platformRevision: main
