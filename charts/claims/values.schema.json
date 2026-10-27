@@ -135,7 +135,10 @@
         "externalZone",
         "internalZone",
         "externalAddress",
-        "internalAddress"
+        "internalAddress",
+        "privateServicesRange",
+        "proxyOnlyRange",
+        "podSecurityVersion"
       ],
       "properties": {
         "projectID": {
@@ -193,6 +196,18 @@
         "internalAddress": {
           "type": "string",
           "pattern": "^[a-z]([-a-z0-9]*[a-z0-9])?$"
+        },
+        "privateServicesRange": {
+          "type": "string",
+          "pattern": "^([0-9]{1,3}\\.){3}[0-9]{1,3}/[0-9]{1,2}$"
+        },
+        "proxyOnlyRange": {
+          "type": "string",
+          "pattern": "^([0-9]{1,3}\\.){3}[0-9]{1,3}/[0-9]{1,2}$"
+        },
+        "podSecurityVersion": {
+          "type": "string",
+          "pattern": "^v1\\.[0-9]{1,2}$"
         }
       }
     }

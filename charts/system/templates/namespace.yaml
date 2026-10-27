@@ -19,6 +19,22 @@ metadata:
   name: {{ $name }}
   labels:
     {{- include "system.labels" . | nindent 4 }}
+    # Pod Security Admission (C-34, ADR-0021 §15). `baseline` is enforced: a
+    # privileged pod, a host-namespace pod or a hostPath mount is refused at
+    # admission, and every current workload passes it. `restricted` is only
+    # warned about and audited, not enforced: the platform's seed and GRANT Jobs
+    # do not pass it yet (platform-config#21), and enforcing it would show as a
+    # Job with no pods and a FailedCreate event. The version is pinned to the
+    # cluster's minor (environment.podSecurityVersion) so a cluster upgrade
+    # does not change what the levels mean. Pod Security labels sit on the
+    # Namespace, which a team's `admin` role can edit with kubectl; Argo CD puts
+    # them back at its next sync. That is the stated limit of C-34.
+    pod-security.kubernetes.io/enforce: baseline
+    pod-security.kubernetes.io/enforce-version: {{ include "system.env" (list .Values "podSecurityVersion") | quote }}
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/warn-version: {{ include "system.env" (list .Values "podSecurityVersion") | quote }}
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/audit-version: {{ include "system.env" (list .Values "podSecurityVersion") | quote }}
   annotations:
     platform.thecloudgeek.io/repo: {{ .Values.spec.owner.repo | quote }}
     # The project Config Connector uses for any object in this namespace that

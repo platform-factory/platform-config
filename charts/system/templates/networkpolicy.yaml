@@ -1,0 +1,115 @@
+{{- $name := .Values.metadata.name }}
+{{- $psa := include "system.env" (list .Values "privateServicesRange") }}
+{{- $proxyOnly := include "system.env" (list .Values "proxyOnlyRange") }}
+---
+# C-34 (ADR-0021 §15, platform-config#21): a tenant namespace is isolated by
+# default. This policy selects every pod and allows nothing, in either direction;
+# `platform-allow` below adds back exactly what the golden path needs.
+#
+# THIS NEEDS A CLUSTER THAT ENFORCES NETWORK POLICY. The API server accepts a
+# NetworkPolicy on any cluster, and nothing enforces it unless the cluster has a
+# network-policy plugin: layer 2's `datapath_provider = ADVANCED_DATAPATH`
+# (Dataplane V2) is that (ADR-0021 §12). Applied to a cluster without it, this
+# changes nothing and a "second tenant cannot reach the first" test would fail
+# with no obvious cause.
+#
+# KUBELET PROBES, `kubectl port-forward`, Argo CD, Config Connector and Kyverno
+# need no rule: node-originated traffic is always allowed, port-forward
+# connects from inside the pod, and none of the three connects to tenant pods.
+#
+# THE LIMIT, STATED: a team holds `admin` here and can delete this policy or add
+# an allow-all NetworkPolicy for its own pods (Argo CD puts the platform's back at
+# the next sync). A connection also needs the target namespace to let it in, so
+# an allow-all opens only that team's own pods. NetworkPolicies only add allows,
+# so a tenant-written policy can only widen its own pods' reach, never narrow
+# the platform's default.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: platform-default-deny
+  namespace: {{ $name }}
+  labels:
+    {{- include "system.labels" . | nindent 4 }}
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+---
+# What the golden path needs, and no more. Every rule here is one the C-34 run
+# can show was needed; the run also records any allow the golden path needed
+# that this list missed (ADR-0021, Consequences).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: platform-allow
+  namespace: {{ $name }}
+  labels:
+    {{- include "system.labels" . | nindent 4 }}
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+  egress:
+    # Name resolution, for every pod.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # The GKE metadata server: Workload Identity tokens on Dataplane V2 (Google's
+    # GKE network-policy page, per platform-config#21). Without it the Auth Proxy
+    # cannot log in and /healthz goes red.
+    - to:
+        - ipBlock:
+            cidr: 169.254.169.254/32
+      ports:
+        - protocol: TCP
+          port: 80
+        - protocol: TCP
+          port: 8080
+    # Cloud SQL, through the Private Services Access range: 3307 for the Auth
+    # Proxy, 5432 for the GRANT Job's psql. The whole range, because an
+    # instance's address is unknown when the chart renders; so between tenants,
+    # database access is limited by IAM alone.
+    - to:
+        - ipBlock:
+            cidr: {{ $psa | quote }}
+      ports:
+        - protocol: TCP
+          port: 3307
+        - protocol: TCP
+          port: 5432
+    # Google APIs, which cannot be pinned to IP addresses: the Auth Proxy fetches
+    # its certificate from the Cloud SQL Admin API, and the GRANT Job looks up
+    # its instance's address there (ADR-0017 §8). Outbound HTTPS stays open to
+    # anywhere until C-14's FQDN policy narrows it; that narrowing must keep the
+    # Cloud SQL Admin API open for both.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+      ports:
+        - protocol: TCP
+          port: 443
+  ingress:
+    # The Gateways (ADR-0021 §4, §15). Google's health checkers and load
+    # balancer front ends (130.211.0.0/22 and 35.191.0.0/16), and the regional
+    # proxy-only subnet the internal Gateway's proxies run in. These admit the
+    # load balancers' traffic to any pod in the namespace; whether a pod is
+    # reached is still the Service and the route. [I: ADR-0021 leaves the exact
+    # allow to the gateway's choice; the run of C-13 records any that is missing.]
+    - from:
+        - ipBlock:
+            cidr: 130.211.0.0/22
+        - ipBlock:
+            cidr: 35.191.0.0/16
+        - ipBlock:
+            cidr: {{ $proxyOnly | quote }}

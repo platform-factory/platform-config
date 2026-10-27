@@ -79,3 +79,27 @@ environment:
   # both (planned, ADR-0021 §12; neither exists yet).
   externalAddress: edge-external
   internalAddress: edge-internal
+
+  # C-34 (ADR-0021 §15, platform-config#21): the facts a tenant namespace's
+  # isolation needs.
+  #
+  # `privateServicesRange` is the Private Services Access range every Cloud SQL
+  # private IP is drawn from; the default-deny's allow list opens TCP 3307 (the
+  # Auth Proxy) and 5432 (the GRANT Job's psql) to the whole range, because an
+  # instance's address is not known when the chart renders. 1-network's
+  # psa_range_cidr output.
+  privateServicesRange: 10.60.0.0/16
+
+  # The regional proxy-only subnet the internal Gateway's Envoy proxies run in
+  # (ADR-0021 §4). A tenant pod sees a connection from it, so the allow list
+  # admits it on ingress, beside Google's health-check and load-balancer ranges.
+  # 1-network's edge_proxy_only_cidr output (planned; the subnet does not exist yet).
+  proxyOnlyRange: 10.40.0.0/23
+
+  # The Kubernetes minor version the Pod Security labels are pinned to. The
+  # default `latest` would move with the cluster's upgrades and change what
+  # `baseline` and `restricted` mean without a pull request. Set it to the
+  # cluster's minor when the cluster is rebuilt (`kubectl version`).
+  # [I: no cluster version is recorded yet; v1.35 is a placeholder for the
+  # REGULAR channel, to be read from the rebuilt cluster before C-34 runs.]
+  podSecurityVersion: v1.35
