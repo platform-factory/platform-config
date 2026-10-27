@@ -11,8 +11,8 @@
 # reports permanent drift. Validate-only keeps `ServerSideDiff` unnecessary and
 # keeps "OutOfSync" meaning what it says.
 #
-# The chart is vendored in this repo (charts/kyverno: upstream 3.9.1, app
-# v1.19.1, unmodified — see charts/README.md), for the same reason every
+# The chart is vendored in this repo (charts/kyverno: upstream 3.9.2, app
+# v1.19.2, unmodified — see charts/README.md), for the same reason every
 # vendored chart is: the repo-server's only allowed internet egress is git to
 # GitHub (C-23, ADR-0010), and a chart repository would be a second one. Chart
 # 3.9.1 declares five dependencies, three of them from external Helm repos, but
@@ -20,6 +20,16 @@
 # CD renders a directory as-is without running `helm dependency update` — so
 # vendoring the tarball is genuinely self-contained here. Verified 2026-09-16
 # against the extracted 3.9.1 tarball.
+#
+# 3.9.2 (vendored 2026-10-27) is a security release: app v1.19.2 fixes 24
+# published advisories, among them three on NamespacedMutatingPolicy writing
+# outside its namespace (GHSA-jcw5-3wcg-fqx5, -f96w-622v-rqpq, -vm98-8c25-h274).
+# Against 3.9.1 the tarball changes version strings and adds one optional
+# field (`filter`, under imageExtractors) to the ClusterPolicy and Policy CRDs;
+# values.yaml and every template are byte-identical, so every reading and line
+# reference below still holds, and no stored CRD version changes (see
+# crds.migration). All seven images exist at v1.19.2 on ghcr.io/kyverno/*,
+# which the ghcr-io remote fronts (anonymous manifest fetch, 2026-10-27).
 apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:
@@ -116,13 +126,37 @@ spec:
           #        | grep kyverno
           #      then delete what it lists — the objects are named
           #      `kyverno-*-webhook-cfg` (names read from kyverno v1.19.1
-          #      pkg/config/config.go, 2026-09-16).
+          #      pkg/config/config.go, 2026-09-16; unchanged at v1.19.2,
+          #      2026-10-27).
           enabled: false
         # `test` is left alone for the same reason: the chart's test Pods carry
         # `helm.sh/hook: test` (templates/tests/_helpers.tpl), which Argo CD
         # does not implement either, so they are never applied and the
         # ghcr.io-pinned readiness-checker image is never pulled. An override
         # here would be configuration that does nothing.
+        rbac:
+          roles:
+            aggregate:
+              # OFF for admin. On, which is the chart's default, the chart
+              # labels its kyverno:rbac:admin:* ClusterRoles aggregate-to-admin,
+              # so the built-in `admin` role every team holds in its namespace
+              # (charts/system/templates/access.yaml) gains create, update and
+              # delete on Kyverno's namespaced policy kinds: kyverno.io Policy
+              # and PolicyException, and policies.kyverno.io's namespaced
+              # kinds, NamespacedMutatingPolicy among them. That lets a team
+              # write admission policy over the objects Argo CD applies in its
+              # namespace: the kubectl half of the door whose git half the
+              # tenant AppProject's blacklist closes. Kyverno policy is the
+              # platform's: kyverno/policies/, applied by kyverno-policies.yaml.
+              admin: false
+              # ON for view, as the chart ships it. The kyverno:rbac:view:*
+              # roles (read on policies and PolicyReports) aggregate into
+              # `view`, which Kubernetes aggregates into `edit` and `edit` into
+              # `admin` (its bootstrap policy labels view aggregate-to-edit and
+              # edit aggregate-to-admin). So a team can still read why
+              # something was flagged, in the PolicyReports the reports
+              # controller writes.
+              view: true
         crds:
           # Kyverno's CRDs are ordinary templates in two subcharts (crds,
           # kyverno-api), not Helm's special crds/ directory, so Argo CD
@@ -136,7 +170,9 @@ spec:
             # rewriting stored CRD versions during an upgrade; on a green-field
             # install there is nothing to migrate. Revisit at the first chart
             # bump — a future bump that changes a stored version will need this
-            # flipped back on for one sync.
+            # flipped back on for one sync. Revisited at 3.9.2 (2026-10-27):
+            # it adds one optional field to two CRDs and changes no stored
+            # version, so this stays off.
             enabled: false
         # Controller resources are left at chart defaults deliberately:
         # ~400m CPU and 320Mi requested across four Deployments (admission,

@@ -45,6 +45,11 @@ What it checks
   9. The reality gate refuses an edit as well as a create and a delete:
      every Kyverno rule whose deny has no conditions sets
      allowExistingViolations to false (ADR-0017 §7).
+ 10. A team cannot write Kyverno policy, by git or by kubectl: every real
+     tenant's AppProject refuses both Kyverno policy groups, and the Kyverno
+     chart, rendered with apps/kyverno.yaml's values, aggregates no role into
+     `admin`. The second half first proves it can fail: with the chart's
+     default it must find the roles it then finds absent.
 
 How to run it
 -------------
@@ -79,6 +84,10 @@ CNRM_ANNOTATIONS = [
     "cnrm.cloud.google.com/project-id",
 ]
 DURABLE_KINDS = {"SQLInstance", "SQLDatabase", "SQLUser", "ArtifactRegistryRepository"}
+# Kyverno's two policy API groups: the legacy kinds, and the CEL kinds with
+# their namespaced variants (NamespacedMutatingPolicy among them).
+KYVERNO_POLICY_GROUPS = ["kyverno.io", "policies.kyverno.io"]
+AGGREGATE_TO_ADMIN = "rbac.authorization.k8s.io/aggregate-to-admin"
 
 failures = []
 
@@ -293,6 +302,18 @@ def check_real_tenants(systems, environment):
         )
         check_cnrm_annotations(objects, name)
         report(set(values_object(output, name)["environment"]) == env_keys, f"  {name}: the claims Application's valuesObject writes every environment key")
+        check_no_policy_from_git(objects, name)
+
+
+def check_no_policy_from_git(objects, label):
+    """The git half of item 10: the tenant's AppProject refuses every kind in
+    both Kyverno policy groups, so its own Application cannot apply one."""
+    projects = [o for o in objects if o["kind"] == "AppProject"]
+    blacklist = set()
+    if len(projects) == 1:
+        blacklist = {(e.get("group"), e.get("kind")) for e in projects[0]["spec"].get("namespaceResourceBlacklist", [])}
+    for group in KYVERNO_POLICY_GROUPS:
+        report((group, "*") in blacklist, f"  {label}: its AppProject refuses every {group} kind from git")
 
 
 def check_cnrm_annotations(objects, label):
@@ -430,6 +451,36 @@ def check_policies():
                 )
 
 
+def kyverno_admin_roles(values):
+    """The ClusterRoles the Kyverno chart, rendered with `values`, labels
+    aggregate-to-admin, or None if it does not render."""
+    with tempfile.TemporaryDirectory() as folder:
+        ok, output = helm_template("kyverno", "kyverno", "kyverno", [write_yaml(folder, "values.yaml", values)])
+    if not ok:
+        return None
+    return sorted(
+        o["metadata"]["name"]
+        for o in documents(output)
+        if o["kind"] == "ClusterRole" and (o["metadata"].get("labels") or {}).get(AGGREGATE_TO_ADMIN) == "true"
+    )
+
+
+def check_no_policy_from_kubectl():
+    """The kubectl half of item 10. Every team holds the built-in `admin` role
+    in its namespace (charts/system/templates/access.yaml), and the chart's
+    default aggregates create, update and delete on Kyverno's namespaced policy
+    kinds into it. apps/kyverno.yaml turns that off; this renders the chart
+    with those values and finds no role aggregated into `admin`."""
+    app = yaml.safe_load((REPO / "apps" / "kyverno.yaml").read_text())
+    values = app["spec"]["source"]["helm"]["valuesObject"]
+    default = copy.deepcopy(values)
+    default["rbac"]["roles"]["aggregate"]["admin"] = True
+    seen = kyverno_admin_roles(default)
+    report(bool(seen), f"with the chart's default, the check finds the roles it guards against: {seen}")
+    found = kyverno_admin_roles(values)
+    report(found == [], f"with apps/kyverno.yaml's values, no Kyverno role aggregates into admin: {found}")
+
+
 def check_lint(systems, environment):
     """helm lint, only with real value files (ADR-0017 §6). Not the gate."""
     tenant = yaml.safe_load((systems / "tenants" / "svc-hello.yaml").read_text())
@@ -477,6 +528,8 @@ def main():
     check_apps(environment, args.branch)
     print("\n== the reality gate refuses an edit too")
     check_policies()
+    print("\n== a team cannot write Kyverno policy with kubectl")
+    check_no_policy_from_kubectl()
     print("\n== helm lint, with real value files")
     check_lint(args.systems, environment)
 

@@ -26,7 +26,7 @@ apps/                          one Application per component — the root syncs 
 └── systems.yaml               wave 4: the tenants — a DIFFERENT repo, github.com/platform-factory/systems, path tenants/
 charts/
 ├── crossplane/                vendored upstream chart 2.3.5, unmodified (see charts/README.md)
-└── kyverno/                   vendored upstream chart 3.9.1, unmodified (see charts/README.md)
+└── kyverno/                   vendored upstream chart 3.9.2, unmodified (see charts/README.md)
 crossplane/
 ├── providers/                 ImageConfig (mirror rule), DeploymentRuntimeConfigs, Provider packages, in waves
 ├── platform/                  ClusterProviderConfig, EnvironmentConfig, composition Functions, Crossplane's aggregated ClusterRole
@@ -647,7 +647,7 @@ else" is what scopes the blast radius to two API groups. The budget is
 `Ignore`, because a cost guardrail should not wedge every tenant's deploys
 when the policy engine is down.
 
-Images: chart 3.9.1's default registry is `reg.kyverno.io`, which is not one of
+Images: chart 3.9.2's default registry is `reg.kyverno.io`, which is not one of
 the five Artifact Registry remotes, so `apps/kyverno.yaml` overrides it to the
 `ghcr-io` remote. One key covers every image that actually runs. Two others
 (`webhooksCleanup`, `test`) pin `ghcr.io` literally and out-rank

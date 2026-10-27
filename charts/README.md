@@ -26,7 +26,7 @@ an OCI source through the `ghcr-io` remote is the alternative.)
 | Chart | Version | Source | sha256 of the tarball | Vendored |
 |---|---|---|---|---|
 | `crossplane` | 2.3.5 (app v2.3.5) | https://charts.crossplane.io/stable/crossplane-2.3.5.tgz | `ad9b5005c9b9885ed7c7db712c1fa78643892782d5b3120aa6e101567d3fb698` | 2026-08-27 |
-| `kyverno` | 3.9.1 (app v1.19.1) | https://kyverno.github.io/kyverno/kyverno-3.9.1.tgz | `7b7fe51a431b5b133b0ce7eb9dcb222b6a37fb967c163223cf480054ad14d752` | 2026-09-16 |
+| `kyverno` | 3.9.2 (app v1.19.2) | https://kyverno.github.io/kyverno/kyverno-3.9.2.tgz | `f6fe7184544d5e2ee33a77808c09e67aa603ce6560cc197038fde31d727c861e` | 2026-10-27 |
 
 Kyverno publishes no chart tarball as a GitHub release asset; the gh-pages
 Helm repository above is upstream's own publishing channel, and the sha256
@@ -35,12 +35,12 @@ locally from the download.
 
 The Kyverno chart declares five dependencies, three of them from other Helm
 repositories (`kyverno-api`, `openreports`, `reports-server`). All five are
-already packaged inside the 3.9.1 tarball under `kyverno/charts/`, and Argo
-CD renders a chart directory as-is without running `helm dependency update`,
-so vendoring stays genuinely offline. Three of those subcharts
-(`grafana`, `openreports`, `reports-server`) are disabled by default and
-render nothing. Kyverno *does* publish its chart as an OCI artifact
-(`ghcr.io/kyverno/charts/kyverno:3.9.1`), which the `ghcr-io` remote fronts —
+already packaged inside the tarball (3.9.1 and 3.9.2 alike) under
+`kyverno/charts/`, and Argo CD renders a chart directory as-is without running
+`helm dependency update`, so vendoring stays genuinely offline. Three of those
+subcharts (`grafana`, `openreports`, `reports-server`) are disabled by default
+and render nothing. Kyverno *does* publish its chart as an OCI artifact
+(`ghcr.io/kyverno/charts/kyverno:3.9.2`), which the `ghcr-io` remote fronts —
 but whether an Artifact Registry remote proxies a non-image OCI artifact is
 untested, so vendoring avoids the question.
 
@@ -55,7 +55,9 @@ header comment of `kyverno/policies/deny-raw-managed-resources.yaml`). Because
 the upgrade procedure below replaces the whole chart directory, a release that
 finally drops those CRDs would show up as a wave-3 sync failure rather than as
 a line in the diff — so read the release notes for a removal schedule before
-bumping.
+bumping. Checked at the 3.9.2 bump (2026-10-27): its `values.yaml` is
+byte-identical to 3.9.1's, deprecation note included, and the v1.19.2 release
+notes announce no removal.
 
 ## Upgrading a chart
 
