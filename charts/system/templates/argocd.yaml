@@ -50,8 +50,17 @@ spec:
       kind: ResourceQuota
     - group: ""
       kind: LimitRange
-    # A tenant cannot write its own policy exceptions.
+    # A tenant cannot write Kyverno policy of either generation: kyverno.io
+    # holds the legacy kinds (Policy, PolicyException), policies.kyverno.io
+    # the CEL ones, including NamespacedMutatingPolicy. A team's mutating
+    # policy would rewrite what Argo CD applies in its namespace (a database's
+    # tier, an IAM member's target, the abandon annotation on create) before
+    # the validating policies judge it, with Argo CD still the requester,
+    # whom the reality gate exempts. apps/kyverno.yaml closes the same two
+    # groups on the kubectl path (rbac.roles.aggregate.admin: false).
     - group: "kyverno.io"
+      kind: "*"
+    - group: "policies.kyverno.io"
       kind: "*"
   roles:
     # Inert until Argo CD has single sign-on. Argo CD groups come from its own
