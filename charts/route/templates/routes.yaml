@@ -1,0 +1,71 @@
+{{- /*
+One route: an HTTPRoute, and for an external route one GCPBackendPolicy.
+Nothing else (the `edge` AppProject's whitelist is exactly these two kinds,
+ADR-0021 §3).
+
+THE FOLDER IS THE ONLY INPUT THAT SAYS HOW EXPOSED A ROUTE IS (ADR-0021 §2).
+`platform.exposure` comes from the folder the file sits in, written by the
+edge ApplicationSet into helm.valuesObject, so the file cannot set it. It picks
+the Gateway (`external` or `internal`, in namespace `edge`), the zone the
+hostname is built from, and whether the Cloud Armor policy is attached. The
+internal-to-external flip is one `git mv`: this chart renders the other
+Gateway, the other zone, and the policy.
+*/ -}}
+{{- $exposure := .Values.platform.exposure }}
+{{- $ns := .Release.Namespace }}
+{{- $zone := include "route.env" (list .Values (printf "%sZone" $exposure)) }}
+{{- /* The route's name carries its exposure. Two files with the same name in
+       the two folders, in one System, would otherwise render one HTTPRoute
+       from two Applications, and the flip would have the old Application's
+       delete race the new one's create. */ -}}
+{{- $name := printf "%s-%s" .Values.platform.route $exposure }}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: {{ $name }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "route.labels" . | nindent 4 }}
+spec:
+  # The Gateway the platform owns for this exposure (edge/, ADR-0021 §4). It
+  # accepts this route only because the namespace carries the System label
+  # (its allowedRoutes), a second wall beside `require-system-label` [I].
+  parentRefs:
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+      name: {{ $exposure }}
+      namespace: edge
+  hostnames:
+    - {{ printf "%s.%s" .Values.host $zone | quote }}
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: {{ .Values.path | default "/" | quote }}
+      backendRefs:
+        - name: {{ .Values.service | quote }}
+          port: {{ .Values.port }}
+{{- if eq $exposure "external" }}
+---
+# Cloud Armor, attached through the Service (ADR-0021 §7). GKE attaches one
+# GCPBackendPolicy to a Service at a time, so the policy is named after the
+# Service and a second external route naming the same `service` in this System
+# would render the same object; edge-config's check refuses that pair [C, GKE
+# "Configure Gateway resources", read 2026-10-27, per ADR-0021 §7]. The policy
+# `edge-external` is a layer-1 Terraform resource (ADR-0021 §12).
+apiVersion: networking.gke.io/v1
+kind: GCPBackendPolicy
+metadata:
+  name: {{ .Values.service }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "route.labels" . | nindent 4 }}
+spec:
+  default:
+    securityPolicy: edge-external
+  targetRef:
+    group: ""
+    kind: Service
+    name: {{ .Values.service | quote }}
+{{- end }}

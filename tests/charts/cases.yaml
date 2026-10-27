@@ -3,15 +3,22 @@
 # evidence only once it has been seen to fail).
 #
 # Each case names:
-#   chart:     system or claims
+#   chart:     system, claims or route
 #   tenant:    a file under tests/charts/tenants/ (or, for a system case,
 #              `tenant_file:` inline, to test a bad tenant file)
 #   claims:    the service's claims.yaml, inline (claims cases only; leave it
 #              out for a service with no claims.yaml)
 #   retired:   the retired list (default: empty)
-#   namespace: the release namespace (default: the tenant's name)
+#   namespace: the release namespace (default: the tenant's name; for a route
+#              case, the System the route's folder names)
 #   expect:    must-fail only. Text the refusal must contain, so a case that
 #              fails for the WRONG reason is caught too.
+#
+# A route case (ADR-0021 §2) takes `route:`, the route file inline (default:
+# host hello, service svc-hello, port 80), and `platform:`, merged over the
+# platform's keys for an external route in svc-hello (exposure, system,
+# route). It is rendered the way an edge ApplicationSet makes Argo CD render
+# it: the route file, then the environment file, then the platform keys.
 #
 # A claims case is rendered the way Argo CD renders it: charts/system first,
 # with the tenant file, the retired list and the real environment file; then
@@ -62,6 +69,129 @@ must_fail:
     chart: system
     tenant_file: {spec: {size: XL}}
     expect: "at '/spec/size'"
+
+  # ---- charts/system: the edge namespace is reserved (ADR-0021 §4) -------
+  - name: system name is the edge namespace
+    chart: system
+    tenant_file: {metadata: {name: edge}}
+    expect: "at '/metadata/name': 'allOf' failed"
+
+  # ---- charts/route: the route file's form (ADR-0021 §2; C-10) ------------
+  # The file's top level is closed to host, service, port and path. The
+  # platform's keys live under `platform`, so a top-level one is an unknown key.
+  - name: route file has a top-level exposure, in the external folder
+    chart: route
+    route: {host: hello, service: svc-hello, port: 80, exposure: internal}
+    expect: "additional properties 'exposure' not allowed"
+  - name: route file has a top-level exposure, in the internal folder
+    chart: route
+    platform: {exposure: internal}
+    route: {host: hello, service: svc-hello, port: 80, exposure: external}
+    expect: "additional properties 'exposure' not allowed"
+  - name: route file has a top-level system
+    chart: route
+    route: {host: hello, service: svc-hello, port: 80, system: another-svc}
+    expect: "additional properties 'system' not allowed"
+  - name: route file has a top-level route
+    chart: route
+    route: {host: hello, service: svc-hello, port: 80, route: other}
+    expect: "additional properties 'route' not allowed"
+  - name: route file has an unknown key
+    chart: route
+    route: {host: hello, service: svc-hello, port: 80, weight: 10}
+    expect: "additional properties 'weight' not allowed"
+  - name: route file has an unknown key under platform
+    chart: route
+    route: {host: hello, service: svc-hello, port: 80, platform: {team: payments}}
+    expect: "additional properties 'team' not allowed"
+  - name: route file leaves out the host
+    chart: route
+    route: {service: svc-hello, port: 80}
+    expect: "missing property 'host'"
+  - name: route file leaves out the service
+    chart: route
+    route: {host: hello, port: 80}
+    expect: "missing property 'service'"
+  - name: route file leaves out the port
+    chart: route
+    route: {host: hello, service: svc-hello}
+    expect: "missing property 'port'"
+  - name: port is a string
+    chart: route
+    route: {host: hello, service: svc-hello, port: "80"}
+    expect: "at '/port'"
+  - name: port is not an integer
+    chart: route
+    route: {host: hello, service: svc-hello, port: 80.5}
+    expect: "at '/port'"
+  - name: port is zero
+    chart: route
+    route: {host: hello, service: svc-hello, port: 0}
+    expect: "at '/port'"
+  - name: port is out of range
+    chart: route
+    route: {host: hello, service: svc-hello, port: 65536}
+    expect: "at '/port'"
+  - name: host has a capital letter
+    chart: route
+    route: {host: Hello, service: svc-hello, port: 80}
+    expect: "at '/host'"
+  - name: host has a dot
+    chart: route
+    route: {host: hello.world, service: svc-hello, port: 80}
+    expect: "at '/host'"
+  - name: host starts with a hyphen
+    chart: route
+    route: {host: -hello, service: svc-hello, port: 80}
+    expect: "at '/host'"
+  - name: host ends with a hyphen
+    chart: route
+    route: {host: hello-, service: svc-hello, port: 80}
+    expect: "at '/host'"
+  - name: host starts with a digit
+    chart: route
+    route: {host: 1hello, service: svc-hello, port: 80}
+    expect: "at '/host'"
+  - name: host is one character
+    chart: route
+    route: {host: a, service: svc-hello, port: 80}
+    expect: "at '/host'"
+  - name: host is 33 characters
+    chart: route
+    route: {host: abcdefghijklmnopqrstuvwxyzabcdefg, service: svc-hello, port: 80}
+    expect: "at '/host'"
+  - name: host has an underscore
+    chart: route
+    route: {host: hello_world, service: svc-hello, port: 80}
+    expect: "at '/host'"
+  - name: host is a wildcard
+    chart: route
+    route: {host: "*", service: svc-hello, port: 80}
+    expect: "at '/host'"
+  - name: service is not a DNS label
+    chart: route
+    route: {host: hello, service: Svc_Hello, port: 80}
+    expect: "at '/service'"
+  - name: path has no leading slash
+    chart: route
+    route: {host: hello, service: svc-hello, port: 80, path: api}
+    expect: "at '/path'"
+  - name: path has a space
+    chart: route
+    route: {host: hello, service: svc-hello, port: 80, path: "/a b"}
+    expect: "at '/path'"
+  - name: the folder's exposure is neither
+    chart: route
+    platform: {exposure: both}
+    expect: "at '/platform/exposure'"
+  - name: rendered into another System's namespace
+    chart: route
+    namespace: another-svc
+    expect: "only renders into its own System's namespace"
+  - name: rendered into the edge namespace
+    chart: route
+    platform: {system: edge}
+    expect: "at '/platform/system'"
 
   # ---- charts/claims: the tenant boundary (ADR-0017 §5, §6; C-28 (b)) -----
   - name: claim name contains a hyphen
@@ -170,3 +300,9 @@ must_pass:
   - name: a System that leaves its tier out
     chart: system
     tenant: no-tier-svc
+  - name: an external route with the default path
+    chart: route
+  - name: an internal route with a path prefix
+    chart: route
+    platform: {exposure: internal}
+    route: {host: hello, service: svc-hello, port: 8080, path: /api/v1}

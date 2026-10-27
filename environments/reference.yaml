@@ -62,3 +62,12 @@ environment:
   # repo's CI fails a branch whose platform-config sources say `main`, and
   # fails `main` if a source names anything else.
   platformRevision: main
+
+  # ADR-0021 §3 and §5: the two zones a route's hostname is built from,
+  # <host>.<zone>. Both are Cloud DNS zones in the one project, each with one
+  # wildcard A record to its Gateway's address, so a route changes no DNS.
+  # `externalZone` is public, delegated from Cloudflare by one manual step;
+  # `internalZone` is private, bound to the VPC. 1-network creates both
+  # (planned, ADR-0021 §12; neither exists yet).
+  externalZone: ref.thecloudgeek.io
+  internalZone: internal.ref.thecloudgeek.io

@@ -1,0 +1,13 @@
+# Deliberately empty.
+#
+# A chart's values.yaml is a value layer beneath every other, so a key left
+# here would quietly fill in one that a real input forgot (ADR-0017 §6). This
+# chart's inputs arrive from exactly three places, in Argo CD's order:
+#   - the route file in edge-config (`host`, `service`, `port`, `path`), as a
+#     value file;
+#   - the environment's facts (`environment:`), as the last value file, which
+#     no route file can replace;
+#   - the folder's facts (`platform:`: exposure, system, route), which the
+#     edge ApplicationSets write into `helm.valuesObject`, above every value
+#     file (ADR-0021 §2).
+# values.schema.json checks the merged result and refuses anything else.

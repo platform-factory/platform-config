@@ -1,0 +1,9 @@
+apiVersion: v2
+name: route
+description: >-
+  One route file from the edge-config repo, turned into an HTTPRoute (and, for
+  an external route, a GCPBackendPolicy) in the System's namespace. Only the
+  platform renders this chart; the folder the file sits in says how exposed it
+  is (ADR-0021 §2).
+type: application
+version: 0.1.0
