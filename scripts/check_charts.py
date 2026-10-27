@@ -84,6 +84,13 @@ What it checks
      that selects every pod and allows nothing, and an allow list that is
      exactly platform-config#21's egress plus the three ingress ranges
      (ADR-0021 §15). The check first proves it can fail.
+ 12. C-24: charts/system renders no Cloud SQL grant; charts/claims renders, per
+     database, four IAMPolicyMembers (client and instanceUser, for the app and
+     for the team), each conditioned on `resource.name ==
+     "projects/<project>/instances/<system>-<claim>"` and nothing else, with
+     the team in the team members' names, so a team move renders new members
+     and leaves the condition alone (ADR-0021 §14, ADR-0017 §10). The check
+     first proves it can fail.
 
 How to run it
 -------------
@@ -302,6 +309,13 @@ def check_cases(environment):
         # against pruning to empty applies.
         if case["chart"] == "claims" and not (case.get("claims") or {}).get("databases"):
             report(not documents(output), f"  '{case['name']}' rendered no object at all")
+        # C-24: whatever databases a case asks for, each gets exactly its own
+        # four conditioned grants (ADR-0021 §14).
+        if case["chart"] == "claims" and (case.get("claims") or {}).get("databases") and "namespace" not in case:
+            tenant = load_fixture_tenant(case.get("tenant", "standard-svc"))
+            env = environment["environment"]
+            found = grant_problems(documents(output), tenant["metadata"]["name"], tenant["spec"]["owner"]["team"], env["projectID"], env["orgDomain"], case["claims"]["databases"])
+            report(not found, f"  '{case['name']}' grants each database to its own instance only" + (f": {found}" if found else ""))
 
 
 def check_environment_keys(environment):
@@ -375,6 +389,10 @@ def check_real_tenants(systems, environment):
         check_no_policy_from_git(objects, name)
         check_no_edge_from_git(objects, name)
         check_isolation(objects, environment, name)
+        report(
+            not [o for o in objects if o["kind"] == "IAMPolicyMember" and o["spec"]["role"].startswith("roles/cloudsql")],
+            f"  {name}: charts/system renders no Cloud SQL grant (they are charts/claims', one conditioned pair per database)",
+        )
 
 
 def check_no_policy_from_git(objects, label):
@@ -406,10 +424,14 @@ def check_svc_hello_matches_live(systems, environment):
     The full field-by-field comparison with the live instance is a step of the
     first cluster session; this pins the fields the chart sets.
 
-    Two differences from what is live are intended, so the first update is
+    Three differences from what is live are intended, so the first update is
     not empty: the chart states activationPolicy ALWAYS, which wakes a parked
-    instance (ADR-0017 §12), and it leaves out the old engine's `managed-by`
-    label (ADR-0017 §8)."""
+    instance (ADR-0017 §12); it leaves out the old engine's `managed-by`
+    label (ADR-0017 §8); and from M3 the instance's four Cloud SQL grants are
+    conditioned on its exact name (ADR-0021 §14), where the live project
+    policy still holds the M2 grants unconditioned until Argo CD prunes them
+    when this merges (ADR-0017 §10). The rows below compare the new grants with what the live
+    policy would have to hold; the cloud side is read by C-24's run."""
     tenant = yaml.safe_load((systems / "tenants" / "svc-hello.yaml").read_text())
     claims = {"databases": {"main": {"engine": "POSTGRES_16", "region": "us-central1", "size": "S", "tier": "standard", "backups": True}}}
     with tempfile.TemporaryDirectory() as folder:
@@ -418,8 +440,10 @@ def check_svc_hello_matches_live(systems, environment):
     if not ok:
         report(False, f"svc-hello's database does not render:\n{output}")
         return
-    objects = {o["kind"]: o for o in documents(output)}
-    check_cnrm_annotations(list(objects.values()), "svc-hello's database")
+    all_objects = documents(output)
+    grants = [o for o in all_objects if o["kind"] == "IAMPolicyMember"]
+    objects = {o["kind"]: o for o in all_objects if o["kind"] != "IAMPolicyMember"}
+    check_cnrm_annotations(all_objects, "svc-hello's database")
     instance = objects["SQLInstance"]
     settings = instance["spec"]["settings"]
     env = environment["environment"]
@@ -447,6 +471,20 @@ def check_svc_hello_matches_live(systems, environment):
         "database deletionPolicy": (objects["SQLDatabase"]["spec"]["deletionPolicy"], "ABANDON"),
         "IAM user": (objects["SQLUser"]["spec"]["resourceID"], f"svc-hello@{env['projectID']}.iam"),
         "IAM user type": (objects["SQLUser"]["spec"]["type"], "CLOUD_IAM_SERVICE_ACCOUNT"),
+        # C-24: the app's service account and the owning team's group, each with
+        # both roles, each on this instance by exact name.
+        "Cloud SQL grants (principal, role)": (
+            sorted((g["spec"]["member"], g["spec"]["role"]) for g in grants),
+            sorted(
+                (member, role)
+                for member in (f"serviceAccount:svc-hello@{env['projectID']}.iam.gserviceaccount.com", f"group:payments@{env['orgDomain']}")
+                for role in ("roles/cloudsql.client", "roles/cloudsql.instanceUser")
+            ),
+        ),
+        "Cloud SQL grants' conditions": (
+            sorted({g["spec"]["condition"]["expression"] for g in grants}),
+            [f'resource.name == "projects/{env["projectID"]}/instances/svc-hello-main"'],
+        ),
     }
     for field, (rendered, live) in expected.items():
         report(rendered == live, f"  svc-hello-main {field}: rendered {rendered!r}, live {live!r}")
@@ -952,7 +990,7 @@ def check_edge_git_door_can_fail():
         report(found == [f"{entry[0]}/{entry[1]}"], f"  the git-door check names {entry[0]}/{entry[1]} when it is missing")
 
 
-# M3b: C-34, tenant isolation by default (ADR-0021 §15)
+# M3b: C-34 (ADR-0021 §15) and C-24 (ADR-0021 §14)
 # ---------------------------------------------------------------------------
 
 PSS_LEVELS = {"enforce": "baseline", "warn": "restricted", "audit": "restricted"}
@@ -1045,6 +1083,93 @@ def check_isolation(objects, environment, label, mutations=False):
         copied.sort(key=lambda o: o["kind"] != "Namespace")
         edit(copied)
         report(bool(isolation_problems(copied, environment)), f"  the isolation check catches {what}")
+
+
+CLOUDSQL_ROLES = {"roles/cloudsql.client": "sql-client", "roles/cloudsql.instanceUser": "sql-instance-user"}
+
+
+def grant_problems(objects, system, team, project, org_domain, claims):
+    """C-24, as ADR-0021 §14 describes it. `objects` is a claims render. Returns
+    the problems found; none means each database has exactly its own four
+    conditioned grants."""
+    problems = []
+    members = [o for o in objects if o["kind"] == "IAMPolicyMember"]
+    gsa = f"serviceAccount:{system}@{project}.iam.gserviceaccount.com"
+    group = f"group:{team}@{org_domain}"
+    expected = {}
+    for claim in claims:
+        instance = f"{system}-{claim}"
+        for role, short in CLOUDSQL_ROLES.items():
+            expected[f"{instance}-{short}-app"] = (instance, role, gsa)
+            expected[f"{instance}-{short}-team-{team}"] = (instance, role, group)
+    got = {m["metadata"]["name"]: m for m in members}
+    if sorted(got) != sorted(expected):
+        problems.append(f"expected members {sorted(expected)}, found {sorted(got)}")
+    for name, (instance, role, member) in expected.items():
+        m = got.get(name)
+        if m is None:
+            continue
+        spec = m["spec"]
+        if (spec.get("role"), spec.get("member")) != (role, member):
+            problems.append(f"{name}: role and member must be {role} and {member}, found {spec.get('role')} and {spec.get('member')}")
+        if spec.get("resourceRef") != {"kind": "Project", "external": f"projects/{project}"}:
+            problems.append(f"{name}: must bind at the project, found {spec.get('resourceRef')}")
+        if (spec.get("condition") or {}).get("expression") != f'resource.name == "projects/{project}/instances/{instance}"':
+            problems.append(f"{name}: the condition must name exactly the instance {instance}, found {(spec.get('condition') or {}).get('expression')!r}")
+        if m["metadata"]["namespace"] != system or m["metadata"]["labels"].get(SYSTEM_LABEL) != system:
+            problems.append(f"{name}: must be in {system}'s namespace with its System label")
+    return problems
+
+
+def check_grants(environment):
+    env = environment["environment"]
+    project, org = env["projectID"], env["orgDomain"]
+    tenant = load_fixture_tenant("standard-svc")
+    databases = {"main": {"engine": "POSTGRES_16", "region": "us-central1", "size": "S"}, "second": {"engine": "POSTGRES_16", "region": "us-central1", "size": "S"}}
+    renders = {}
+    for team in ("team-a", "team-b"):
+        t = deep_merge(tenant, {"spec": {"owner": {"team": team}}})
+        with tempfile.TemporaryDirectory() as folder:
+            ok, output = render_system(folder, t, [], environment)
+            report(ok, f"standard-svc renders with team {team}")
+            if not ok:
+                return
+            report(
+                not [o for o in documents(output) if o["kind"] == "IAMPolicyMember" and o["spec"]["role"].startswith("roles/cloudsql")],
+                f"  charts/system renders no Cloud SQL grant for team {team}: they are charts/claims'",
+            )
+            ok, rendered = render_claims(folder, "standard-svc", {"databases": databases}, values_object(output, "standard-svc"))
+        renders[team] = documents(rendered)
+        found = grant_problems(renders[team], "standard-svc", team, project, org, databases)
+        report(not found, f"  two databases, team {team}: four conditioned grants each, on their own instance only" + (f": {found}" if found else ""))
+    # A team move (ADR-0017 §10): the team members get new names, so Argo CD
+    # applies new ones and prunes the old; the app's members and every
+    # condition are untouched.
+    names = {team: {m["metadata"]["name"] for m in docs if m["kind"] == "IAMPolicyMember"} for team, docs in renders.items()}
+    changed = names["team-a"] ^ names["team-b"]
+    report(len(changed) == 8 and all("-team-team-" in n for n in changed), f"  a team move renames exactly the team members: 4 old names out, 4 new in ({len(changed)} names differ); the app's members keep theirs")
+    conditions = {team: sorted(m["spec"]["condition"]["expression"] for m in docs if m["kind"] == "IAMPolicyMember") for team, docs in renders.items()}
+    report(conditions["team-a"] == conditions["team-b"], "  a team move leaves every condition as it was")
+    # Two Systems where one name extends the other would match under a prefix.
+    # The exact name does not: the conditions of `orders` and `orders-api`
+    # never contain each other's instance name. (ADR-0021 lists the live
+    # overmatch fixture as not planned; this is the render-side half.)
+    exprs = lambda system: [f'resource.name == "projects/{project}/instances/{system}-main"']
+    report(exprs("orders")[0] != exprs("orders-api")[0] and not exprs("orders")[0].startswith(exprs("orders-api")[0]) and "orders-api-main" not in exprs("orders")[0], "  the exact name for `orders` does not match `orders-api-main`")
+
+    mutations = {
+        "a prefix condition": lambda os: next(o for o in os if o["kind"] == "IAMPolicyMember")["spec"]["condition"].update(expression=f'resource.name.startsWith("projects/{project}/instances/standard-svc")'),
+        "an unconditioned member": lambda os: next(o for o in os if o["kind"] == "IAMPolicyMember")["spec"].pop("condition"),
+        "another System's instance": lambda os: next(o for o in os if o["kind"] == "IAMPolicyMember")["spec"]["condition"].update(expression=f'resource.name == "projects/{project}/instances/other-svc-main"'),
+        "a missing member": lambda os: os.remove(next(o for o in os if o["kind"] == "IAMPolicyMember")),
+        "a team name without the team": lambda os: next(o for o in os if o["kind"] == "IAMPolicyMember" and "-team-" in o["metadata"]["name"])["metadata"].update(name="standard-svc-main-sql-client-team"),
+        "the wrong principal": lambda os: next(o for o in os if o["kind"] == "IAMPolicyMember")["spec"].update(member="allUsers"),
+        "a binding on the instance resource": lambda os: next(o for o in os if o["kind"] == "IAMPolicyMember")["spec"].update(resourceRef={"kind": "SQLInstance", "name": "x"}),
+    }
+    for what, edit in mutations.items():
+        copied = copy.deepcopy(renders["team-a"])
+        edit(copied)
+        report(bool(grant_problems(copied, "standard-svc", "team-a", project, org, databases)), f"  the grant check catches {what}")
 
 
 def check_isolation_can_fail(environment):
@@ -1168,6 +1293,8 @@ def main():
     check_edge_git_door_can_fail()
     print("\n== a tenant namespace is isolated by default (C-34)")
     check_isolation_can_fail(environment)
+    print("\n== Cloud SQL grants are conditioned per database (C-24)")
+    check_grants(environment)
     print("\n== the reality gate refuses an edit too")
     check_policies()
     print("\n== a team cannot write Kyverno policy with kubectl")

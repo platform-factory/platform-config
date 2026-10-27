@@ -42,7 +42,8 @@ spec:
 ---
 # The team may push to its own registry: roles/artifactregistry.writer, push
 # and pull, not repository or IAM management. The team is in the name because
-# an IAM member's fields cannot change (see identity.yaml).
+# an IAM member's fields cannot change (ADR-0017 §10): a team move renders a
+# new member and Argo CD prunes the old, here and in charts/claims' grants.
 #
 # Not conditioned per System: Config Connector refuses a condition on an
 # Artifact Registry member (ADR-0017 §10).
