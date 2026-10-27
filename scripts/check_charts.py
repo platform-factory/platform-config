@@ -834,7 +834,10 @@ def edge_policy_problems(policies):
         problems.append("the Service rule must deny exactly type LoadBalancer and NodePort")
 
     for rule, operations, exempt in (
-        (create, ["CREATE", "UPDATE"], {ARGOCD}),
+        # The garbage collector on UPDATE removes the foregroundDeletion
+        # finalizer an Argo CD prune leaves; refused, a removed route would stay
+        # terminating (the M3 readiness note's correction of 2026-10-27).
+        (create, ["CREATE", "UPDATE"], {ARGOCD, GARBAGE_COLLECTOR}),
         (delete, ["DELETE"], {ARGOCD, NAMESPACE_CONTROLLER, GARBAGE_COLLECTOR}),
     ):
         block = _match_blocks(rule)[0]
@@ -893,7 +896,8 @@ def check_edge_policies():
     mutations = {
         "a Service rule that exempts Argo CD": lambda ps: rule(ps, "deny-edge-objects", service).update(exclude={"any": [{"subjects": [{"kind": "ServiceAccount", "name": "argocd-application-controller", "namespace": "argocd"}]}]}),
         "a Service rule that also lets NodePort through": lambda ps: rule(ps, "deny-edge-objects", service)["validate"]["deny"]["conditions"]["any"][0].update(value=["LoadBalancer"]),
-        "a create rule that exempts the garbage collector": lambda ps: rule(ps, "deny-edge-objects", create)["exclude"]["any"][0]["subjects"].append({"kind": "ServiceAccount", "name": GARBAGE_COLLECTOR[0], "namespace": GARBAGE_COLLECTOR[1]}),
+        "a create rule that exempts the namespace controller": lambda ps: rule(ps, "deny-edge-objects", create)["exclude"]["any"][0]["subjects"].append({"kind": "ServiceAccount", "name": NAMESPACE_CONTROLLER[0], "namespace": NAMESPACE_CONTROLLER[1]}),
+        "a create rule that refuses the garbage collector": lambda ps: rule(ps, "deny-edge-objects", create)["exclude"]["any"][0]["subjects"].pop(),
         "a delete rule that refuses the garbage collector": lambda ps: rule(ps, "deny-edge-objects", delete)["exclude"]["any"][0]["subjects"].pop(),
         "a whole networking.gke.io group": lambda ps: rule(ps, "deny-edge-objects", create)["match"]["any"][0]["resources"]["kinds"].append("networking.gke.io/*/*"),
         "a missing GKE kind": lambda ps: rule(ps, "deny-edge-objects", delete)["match"]["any"][0]["resources"]["kinds"].remove("networking.gke.io/*/LBPolicy"),

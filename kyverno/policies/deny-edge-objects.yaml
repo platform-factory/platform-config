@@ -20,7 +20,9 @@
 # into tenant namespaces as that identity. That is safe only because, for
 # these kinds, the git door has its own wall: a tenant's Application cannot
 # apply them, by its AppProject's blacklist. The same identity carries a
-# tenant's k8s/, which is why the Service rule exempts nobody.
+# tenant's k8s/, which is why the Service rule exempts nobody. The create and
+# update rule also exempts the garbage collector, which only edits metadata:
+# it removes the foregroundDeletion finalizer an Argo CD prune leaves.
 #
 # WHY THE GKE GROUP IS LISTED BY KIND. GKE's own controllers write
 # ServiceNetworkEndpointGroup objects of the networking.gke.io group into a
@@ -129,6 +131,15 @@ spec:
               - kind: ServiceAccount
                 name: argocd-application-controller
                 namespace: argocd
+              # The garbage collector finishes every prune Argo CD makes: it
+              # removes the foregroundDeletion finalizer with an UPDATE. Without
+              # it a removed route stays terminating, as deny-raw's update rule
+              # did on M2b's first team move (2026-10-19). ADR-0021 §9 named it
+              # for DELETE only; added before the build, recorded in the M3
+              # readiness note's correction of 2026-10-27.
+              - kind: ServiceAccount
+                name: generic-garbage-collector
+                namespace: kube-system
       validate:
         failureAction: Enforce
         # false, for the reason in deny-raw-cloud-resources: with the default
