@@ -1,0 +1,19 @@
+{{- /*
+Renders nothing. It stops the render if the route is about to be applied under
+a System that is not the one its folder names, or into the platform's own
+namespace.
+
+Every object in this chart is built in .Release.Namespace, which Argo CD sets
+from the Application's destination and which no value file can change
+(ADR-0017 §4). `platform.system` comes from the platform's valuesObject, from
+the same path. If the two ever disagree, something upstream is wrong, and
+rendering would attach one System's route to another's namespace.
+*/ -}}
+{{- if ne .Values.platform.system .Release.Namespace }}
+{{- fail (printf "platform.system is %q but this release is in namespace %q; the route chart only renders into its own System's namespace (ADR-0021 §3)." .Values.platform.system .Release.Namespace) }}
+{{- end }}
+{{- /* `edge` is a reserved System name (ADR-0021 §4), so no folder can name it;
+       this is the second wall, for a schema that was loosened. */ -}}
+{{- if eq .Release.Namespace "edge" }}
+{{- fail "a route is never rendered into the platform's own namespace, edge (ADR-0021 §4)." }}
+{{- end }}

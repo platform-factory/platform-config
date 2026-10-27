@@ -1,0 +1,216 @@
+# The edge routes: the `edge` project and the two ApplicationSets that turn
+# edge-config's route files into HTTPRoutes (ADR-0021 §2, §3). Sync wave 5 of
+# the root app-of-apps, after `systems` (wave 4): a route renders into a
+# System's namespace, so the namespace is created first, and an Application
+# for a System that does not exist yet would fail its sync and retry instead.
+#
+# THE FOLDER IS THE ONLY INPUT. A route is one file,
+# edge-config/<exposure>/<system>/<route>.yaml, and the folder says how exposed
+# it is. Each ApplicationSet reads ONE folder and writes what it knows into
+# every generated Application's helm.valuesObject, under `platform`:
+# `exposure` (a literal per ApplicationSet), `system` and `route` (from the
+# file's path). valuesObject outranks every value file, so the route file
+# cannot set them (ADR-0017 §4); the chart's closed schema refuses a file that
+# tries, at its top level (charts/route/values.schema.json). The environment's
+# facts come last among the value files, as in apps/systems.yaml, so a route
+# file cannot replace one either. The internal-to-external flip is one
+# `git mv`, which moves the file to the other generator.
+#
+# WHY THESE TWO DO NOT CARRY ADR-0019 §1's FOUR SETTINGS (ADR-0021 §3). That
+# ADR protects namespaces and data from a removed file; a route is neither.
+# Removing a route file must remove its HTTPRoute, so these ApplicationSets
+# keep Argo CD's default applicationsSync policy (they delete the Application
+# whose file went away), have no Prune=false,Delete=false, and the generated
+# Application carries the resources finalizer, which removes its HTTPRoute and
+# GCPBackendPolicy [C, argo-cd v3.4.6
+# docs/operator-manual/applicationset/Controlling-Resource-Modification.md and
+# Application-Deletion.md]. The cost is stated in the ADR: renaming or emptying
+# `external/` or `internal/` removes every route in it in one sync. A route
+# file the generator cannot parse stops that ApplicationSet generating until
+# it is fixed, and deletes nothing [I; the first M3 session reads what the
+# controller does]. scripts/check_charts.py asserts the exception both ways:
+# the finalizer is there, and nothing here stops a delete.
+#
+# THE GLOB. `external/*/*.yaml` is written as two levels, but the default
+# globbing matches `*` across `/` (the same reason tenants/ must stay flat in
+# the systems repo), so `external/a/b/c.yaml` would also match, with
+# `.path.segments` [external, a, b]. edge-config's check refuses a file that is
+# not exactly <exposure>/<system>/<file>.yaml.
+#
+# THE FILE'S OWN `path` FIELD. A route file may carry `path:` (a prefix). In
+# the template context Argo CD's own `path` object (the file's location)
+# replaces it, which is what this file reads; the file's field reaches the
+# chart through the value file, not through the template [I; the first M3
+# session confirms it on the controller].
+#
+# The Applications run under the platform-owned AppProject `edge`, below: it
+# may write HTTPRoute and GCPBackendPolicy and nothing else.
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: edge
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "5"
+spec:
+  description: "The platform's edge routes. Sources: edge-config and platform-config. May write an HTTPRoute and a GCPBackendPolicy in any namespace, and nothing else (ADR-0021 §3)."
+  sourceRepos:
+    - https://github.com/platform-factory/edge-config
+    - https://github.com/platform-factory/platform-config
+  destinations:
+    # Any namespace, bounded twice more: by the Gateways' allowedRoutes (only
+    # namespaces carrying the System label) and by require-system-label
+    # (ADR-0021 §3, §9) [I; C-11's cases try both].
+    - server: https://kubernetes.default.svc
+      namespace: "*"
+  # A whitelist suits here, unlike the tenant blacklist: these Applications
+  # render two kinds and nothing else. (argo-cd v3.4.6 app_project_types.go:
+  # written as a list it allows exactly those kinds; clusterResourceWhitelist
+  # is absent, which allows no cluster-scoped kind.)
+  namespaceResourceWhitelist:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+    - group: networking.gke.io
+      kind: GCPBackendPolicy
+---
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: edge-external
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "5"
+spec:
+  # Go templates, and a missing field is an error rather than an empty string.
+  goTemplate: true
+  goTemplateOptions: ["missingkey=error"]
+  generators:
+    - git:
+        repoURL: https://github.com/platform-factory/edge-config
+        revision: main
+        files:
+          - path: "external/*/*.yaml"
+  template:
+    metadata:
+      # The exposure is in the name, so the same System and route name in both
+      # folders are two Applications. Not a bare name: that would be a
+      # tenant's Application (charts/system emits <name>).
+      name: 'edge-external-{{ index .path.segments 1 }}-{{ .path.filename | trimSuffix ".yaml" }}'
+      namespace: argocd
+      labels:
+        platform.thecloudgeek.io/system: '{{ index .path.segments 1 }}'
+      # Without this finalizer, deleting the Application (which the
+      # ApplicationSet does when the file goes) would leave its HTTPRoute.
+      finalizers:
+        - resources-finalizer.argocd.argoproj.io
+    spec:
+      project: edge
+      sources:
+        # The chart, and this repository as a value source ($platform), both
+        # at main, the same revision as environment.platformRevision
+        # (ADR-0017 §12).
+        - repoURL: https://github.com/platform-factory/platform-config
+          targetRevision: main
+          path: charts/route
+          ref: platform
+          helm:
+            # In this order, the last one winning: the route file, then the
+            # environment's facts.
+            valueFiles:
+              - "$edge/{{ .path.path }}/{{ .path.filename }}"
+              - $platform/environments/reference.yaml
+            # Above every value file (ADR-0017 §4).
+            valuesObject:
+              platform:
+                exposure: external
+                system: '{{ index .path.segments 1 }}'
+                route: '{{ .path.filename | trimSuffix ".yaml" }}'
+        - repoURL: https://github.com/platform-factory/edge-config
+          targetRevision: main
+          ref: edge
+      destination:
+        server: https://kubernetes.default.svc
+        namespace: '{{ index .path.segments 1 }}'
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+        syncOptions:
+          - ServerSideApply=true
+        retry:
+          limit: 10
+          backoff:
+            duration: 15s
+            factor: 2
+            maxDuration: 5m
+---
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: edge-internal
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "5"
+spec:
+  # Go templates, and a missing field is an error rather than an empty string.
+  goTemplate: true
+  goTemplateOptions: ["missingkey=error"]
+  generators:
+    - git:
+        repoURL: https://github.com/platform-factory/edge-config
+        revision: main
+        files:
+          - path: "internal/*/*.yaml"
+  template:
+    metadata:
+      # The exposure is in the name, so the same System and route name in both
+      # folders are two Applications. Not a bare name: that would be a
+      # tenant's Application (charts/system emits <name>).
+      name: 'edge-internal-{{ index .path.segments 1 }}-{{ .path.filename | trimSuffix ".yaml" }}'
+      namespace: argocd
+      labels:
+        platform.thecloudgeek.io/system: '{{ index .path.segments 1 }}'
+      # Without this finalizer, deleting the Application (which the
+      # ApplicationSet does when the file goes) would leave its HTTPRoute.
+      finalizers:
+        - resources-finalizer.argocd.argoproj.io
+    spec:
+      project: edge
+      sources:
+        # The chart, and this repository as a value source ($platform), both
+        # at main, the same revision as environment.platformRevision
+        # (ADR-0017 §12).
+        - repoURL: https://github.com/platform-factory/platform-config
+          targetRevision: main
+          path: charts/route
+          ref: platform
+          helm:
+            # In this order, the last one winning: the route file, then the
+            # environment's facts.
+            valueFiles:
+              - "$edge/{{ .path.path }}/{{ .path.filename }}"
+              - $platform/environments/reference.yaml
+            # Above every value file (ADR-0017 §4).
+            valuesObject:
+              platform:
+                exposure: internal
+                system: '{{ index .path.segments 1 }}'
+                route: '{{ .path.filename | trimSuffix ".yaml" }}'
+        - repoURL: https://github.com/platform-factory/edge-config
+          targetRevision: main
+          ref: edge
+      destination:
+        server: https://kubernetes.default.svc
+        namespace: '{{ index .path.segments 1 }}'
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+        syncOptions:
+          - ServerSideApply=true
+        retry:
+          limit: 10
+          backoff:
+            duration: 15s
+            factor: 2
+            maxDuration: 5m
