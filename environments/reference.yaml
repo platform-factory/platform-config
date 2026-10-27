@@ -71,3 +71,11 @@ environment:
   # (planned, ADR-0021 §12; neither exists yet).
   externalZone: ref.thecloudgeek.io
   internalZone: internal.ref.thecloudgeek.io
+
+  # ADR-0021 §4: the names of the two reserved addresses the Gateways in
+  # edge/ take by NamedAddress. `externalAddress` is a global static IPv4
+  # address; `internalAddress` is a regional internal one in `region`. The
+  # wildcard records of the two zones above point at them. 1-network reserves
+  # both (planned, ADR-0021 §12; neither exists yet).
+  externalAddress: edge-external
+  internalAddress: edge-internal

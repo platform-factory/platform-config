@@ -157,7 +157,9 @@
         "platformConfigRepo",
         "platformRevision",
         "externalZone",
-        "internalZone"
+        "internalZone",
+        "externalAddress",
+        "internalAddress"
       ],
       "properties": {
         "projectID": {
@@ -207,6 +209,14 @@
         "internalZone": {
           "type": "string",
           "pattern": "^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$"
+        },
+        "externalAddress": {
+          "type": "string",
+          "pattern": "^[a-z]([-a-z0-9]*[a-z0-9])?$"
+        },
+        "internalAddress": {
+          "type": "string",
+          "pattern": "^[a-z]([-a-z0-9]*[a-z0-9])?$"
         }
       }
     }

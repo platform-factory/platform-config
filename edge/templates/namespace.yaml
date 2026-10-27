@@ -1,0 +1,17 @@
+---
+# The namespace the Gateways live in. It deliberately does NOT carry the
+# system label: that label is what makes a namespace a tenant's, and what the
+# Gateways' allowedRoutes, the AppProject blacklist and the Kyverno policies
+# of ADR-0021 §9 key off. A label here would let a route attach from `edge`
+# and subject the platform's own Gateways to the tenant rules. `edge` is a
+# reserved System name, so no tenant file can take it (ADR-0021 §4).
+#
+# Prune=false for the reason every platform namespace has it (ADR-0019 §1): a
+# chart change that stopped rendering it must not delete the Gateways and, with
+# them, the load balancers.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: edge
+  annotations:
+    argocd.argoproj.io/sync-options: Prune=false

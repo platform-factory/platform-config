@@ -1,0 +1,189 @@
+# The reality gate behind "nothing reaches a load balancer except through a
+# Gateway the platform owns" (ADR-0021 §9; C-11).
+#
+# WHY IT EXISTS. A team holds Kubernetes' built-in `admin` role in its own
+# namespace, which can create a Service of type LoadBalancer or an Ingress, and
+# GKE would build a load balancer for either with no review. Nothing was
+# exposed in practice only because the tenants' Services are ClusterIP. The
+# tenant's Argo CD project (charts/system, argocd.yaml) refuses the Ingress,
+# Gateway API and GKE policy kinds from git; this policy refuses everything
+# that reaches the API server, and the Service rule is the only wall for a
+# Service of type LoadBalancer or NodePort, since an AppProject cannot filter
+# by Service type.
+#
+# THE SERVICE RULE EXEMPTS NOBODY. The tenant's own Application is Argo CD too
+# (ADR-0021 §9), so exempting Argo CD would leave the git door open. The
+# platform has no Service of these types to make.
+#
+# THE ROUTE-KIND RULES EXEMPT ARGO CD'S APPLICATION CONTROLLER. They have to:
+# the platform's own `edge` Applications write HTTPRoutes and GCPBackendPolicies
+# into tenant namespaces as that identity. That is safe only because, for
+# these kinds, the git door has its own wall: a tenant's Application cannot
+# apply them, by its AppProject's blacklist. The same identity carries a
+# tenant's k8s/, which is why the Service rule exempts nobody.
+#
+# WHY THE GKE GROUP IS LISTED BY KIND. GKE's own controllers write
+# ServiceNetworkEndpointGroup objects of the networking.gke.io group into a
+# Service's namespace when a route reaches it [I; the first external route
+# records the kind and the identity]. Matching the group whole would refuse
+# them. The Gateway API group is matched whole: nothing else writes it.
+#
+# THE DELETE RULE has the two more identities deny-raw's delete rule lets
+# through, for the same reason: when a tenant is offboarded the namespace
+# controller and the garbage collector delete what is in the namespace.
+#
+# ENFORCED ONLY ONCE THE KINDS EXIST. A kind the cluster does not serve yet is
+# a warning, not an error, and the rule for it enforces nothing (see
+# apps/kyverno-policies.yaml). The Gateway API kinds exist once layer 2 sets
+# the Gateway API channel to standard, so C-11's cluster cases run after that
+# rebuild (ADR-0021 §1).
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: deny-edge-objects
+  annotations:
+    policies.kyverno.io/title: Only the platform makes edge objects
+    policies.kyverno.io/category: Platform Factory
+    policies.kyverno.io/severity: high
+    policies.kyverno.io/subject: Service, Ingress, Gateway API and GKE gateway policy kinds
+    policies.kyverno.io/description: >-
+      In a tenant namespace, nobody may create or change a Service of type
+      LoadBalancer or NodePort, and only Argo CD's application controller may
+      create, change or delete an Ingress, a Gateway API object or a GKE
+      gateway policy. A team asks for a route by a file in edge-config; the
+      platform's chart renders the HTTPRoute.
+spec:
+  validationFailureAction: Enforce
+  # The route-kind rules key off WHO made the request, which exists only on an
+  # admission review.
+  background: false
+  webhookConfiguration:
+    # Fail: Kyverno being down blocks these writes rather than waving them
+    # through. With the Service rule it blocks tenant Service writes too, so
+    # tenant deploys, not only cloud writes (ADR-0021, Consequences; C-33
+    # measures what an outage blocks).
+    failurePolicy: Fail
+  rules:
+    # ---------------------------------------------------------------------
+    - name: no-load-balancer-or-nodeport-services-in-tenant-namespaces
+      skipBackgroundRequests: true
+      match:
+        any:
+          - resources:
+              kinds:
+                - Service
+              operations:
+                - CREATE
+                - UPDATE
+              namespaceSelector:
+                matchExpressions:
+                  - key: platform.thecloudgeek.io/system
+                    operator: Exists
+      # No `exclude`. See the header.
+      validate:
+        failureAction: Enforce
+        # false although this deny has a condition: an edit of a Service that
+        # is already of one of these types is judged on the new object alone,
+        # not let through as "already refused before".
+        allowExistingViolations: false
+        message: >-
+          A Service here is ClusterIP. Nothing is exposed by a Service of type
+          LoadBalancer or NodePort: ask for a route with a file in edge-config
+          (external/ or internal/, under your System's name), and the
+          platform's chart attaches your Service to the platform's Gateway.
+        deny:
+          conditions:
+            any:
+              - key: "{{ request.object.spec.type || 'ClusterIP' }}"
+                operator: AnyIn
+                value:
+                  - LoadBalancer
+                  - NodePort
+
+    # ---------------------------------------------------------------------
+    - name: no-edge-objects-by-hand-in-tenant-namespaces
+      skipBackgroundRequests: true
+      match:
+        any:
+          - resources:
+              kinds:
+                - "networking.k8s.io/*/Ingress"
+                - "gateway.networking.k8s.io/*/*"
+                - "networking.gke.io/*/GCPBackendPolicy"
+                - "networking.gke.io/*/HealthCheckPolicy"
+                - "networking.gke.io/*/GCPGatewayPolicy"
+                - "networking.gke.io/*/GCPSessionAffinityPolicy"
+                - "networking.gke.io/*/GCPTrafficDistributionPolicy"
+                - "networking.gke.io/*/LBPolicy"
+              operations:
+                - CREATE
+                - UPDATE
+              namespaceSelector:
+                matchExpressions:
+                  - key: platform.thecloudgeek.io/system
+                    operator: Exists
+      exclude:
+        any:
+          - subjects:
+              # The writer of the platform's edge Applications.
+              - kind: ServiceAccount
+                name: argocd-application-controller
+                namespace: argocd
+      validate:
+        failureAction: Enforce
+        # false, for the reason in deny-raw-cloud-resources: with the default
+        # an update that "was already refused before" is let through, and this
+        # deny has no conditions, so every update would be.
+        allowExistingViolations: false
+        message: >-
+          Routes are not made by hand here. Ask for one with a file in
+          edge-config (external/ or internal/, under your System's name): the
+          platform's chart renders the HTTPRoute, attached to the platform's
+          Gateway. Ingress, Gateway API and GKE gateway policy objects are the
+          platform's.
+        deny: {}
+
+    # ---------------------------------------------------------------------
+    - name: no-edge-object-deletes-by-hand-in-tenant-namespaces
+      skipBackgroundRequests: true
+      match:
+        any:
+          - resources:
+              kinds:
+                - "networking.k8s.io/*/Ingress"
+                - "gateway.networking.k8s.io/*/*"
+                - "networking.gke.io/*/GCPBackendPolicy"
+                - "networking.gke.io/*/HealthCheckPolicy"
+                - "networking.gke.io/*/GCPGatewayPolicy"
+                - "networking.gke.io/*/GCPSessionAffinityPolicy"
+                - "networking.gke.io/*/GCPTrafficDistributionPolicy"
+                - "networking.gke.io/*/LBPolicy"
+              operations:
+                - DELETE
+              namespaceSelector:
+                matchExpressions:
+                  - key: platform.thecloudgeek.io/system
+                    operator: Exists
+      exclude:
+        any:
+          - subjects:
+              - kind: ServiceAccount
+                name: argocd-application-controller
+                namespace: argocd
+              # The namespace controller and the garbage collector delete what
+              # is in a namespace that is going away. Which identities they
+              # present to admission is [unverified] on GKE; deny-raw's delete
+              # rule makes the same assumption (ADR-0017 §7).
+              - kind: ServiceAccount
+                name: namespace-controller
+                namespace: kube-system
+              - kind: ServiceAccount
+                name: generic-garbage-collector
+                namespace: kube-system
+      validate:
+        failureAction: Enforce
+        allowExistingViolations: false
+        message: >-
+          Routes are not deleted by hand here. To remove one, delete its file
+          from edge-config; the platform's Application removes the HTTPRoute.
+        deny: {}
