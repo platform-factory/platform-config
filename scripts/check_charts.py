@@ -889,7 +889,7 @@ def edge_policy_problems(policies):
         block = _match_blocks(rule)[0]
         if set(block["kinds"]) != ROUTE_KIND_SELECTORS:
             problems.append(f"rule {rule['name']}: kinds must be Ingress, gateway.networking.k8s.io/*/* and the listed GKE kinds by name, found {sorted(block['kinds'])}")
-        if any(k.startswith("networking.gke.io/") and k.rsplit("/", 1)[1] in ("*", "") for k in block["kinds"]):
+        if any(k.split("/", 1)[0] == "networking.gke.io" and k.rsplit("/", 1)[1] in ("*", "") for k in block["kinds"]):
             problems.append(f"rule {rule['name']}: the networking.gke.io group is listed by kind, never whole (ADR-0021 §9)")
         if sorted(block["operations"]) != operations:
             problems.append(f"rule {rule['name']}: operations must be {operations}")
