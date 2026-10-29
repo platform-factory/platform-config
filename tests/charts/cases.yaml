@@ -290,6 +290,13 @@ must_pass:
       databases:
         one: {engine: POSTGRES_16, region: us-central1, size: S}
         two: {engine: POSTGRES_16, region: us-east1, size: M}
+  - name: two databases whose names start alike
+    chart: claims
+    tenant: standard-svc
+    claims:
+      databases:
+        main: {engine: POSTGRES_16, region: us-central1, size: S}
+        mainx: {engine: POSTGRES_16, region: us-central1, size: S}
   - name: a service with no claims.yaml
     chart: claims
     tenant: standard-svc
