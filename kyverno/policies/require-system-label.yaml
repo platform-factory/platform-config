@@ -1,0 +1,113 @@
+# The reality gate behind "everything the platform renders carries its System's
+# label" (ADR-0021 §9; C-11's second half).
+#
+# WHAT IT HOLDS, AND WHAT IT DOES NOT. In a tenant namespace, a gated cloud
+# kind (the Config Connector groups deny-raw-cloud-resources names) or a route
+# kind (the kinds deny-edge-objects names) must carry
+# platform.thecloudgeek.io/system equal to the namespace's name. The rendered
+# Namespace already carries that label (charts/system, _helpers.tpl), so the
+# namespace is the join key for what is inside it. The platform's charts render
+# every such object with the label (charts/system, charts/claims, charts/route),
+# so the rule holds for them by construction and refuses an object that does not.
+#
+# It does not refuse an unlabelled Deployment, and it is not meant to: a
+# validate-only Kyverno cannot add a label, and refusing every unlabelled
+# Deployment would refuse every tenant. ADR-0021 §9 re-scopes "denies
+# untagged resources" to these kinds; C-11's ceiling is ADJUSTED for it.
+#
+# EXEMPTS NOBODY. A platform object carries the label, so Argo CD, Config
+# Connector and the garbage collector pass the rule on the merits, and the
+# rule has no identity list to keep in step with the others. An UPDATE of a
+# labelled object leaves the label alone (a finalizer removal, a status
+# write on the main resource).
+#
+# `allowExistingViolations: false`, although this deny has a condition: an
+# object with the wrong label that is edited to another wrong label is judged on
+# the new object alone, not let through as "already refused before". C-11's
+# cases try a missing label and a label naming another namespace.
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-system-label
+  annotations:
+    policies.kyverno.io/title: Platform objects carry their System's label
+    policies.kyverno.io/category: Platform Factory
+    policies.kyverno.io/severity: medium
+    policies.kyverno.io/subject: Config Connector resources and route kinds
+    policies.kyverno.io/description: >-
+      In a tenant namespace, a cloud object or a route object must carry the
+      label platform.thecloudgeek.io/system with the namespace's name as its
+      value, which is how the platform's charts render them.
+spec:
+  validationFailureAction: Enforce
+  background: false
+  webhookConfiguration:
+    failurePolicy: Fail
+  rules:
+    # ---------------------------------------------------------------------
+    - name: cloud-objects-carry-the-system-label
+      skipBackgroundRequests: true
+      match:
+        any:
+          - resources:
+              kinds:
+                - "sql.cnrm.cloud.google.com/*/*"
+                - "iam.cnrm.cloud.google.com/*/*"
+                - "artifactregistry.cnrm.cloud.google.com/*/*"
+              operations:
+                - CREATE
+                - UPDATE
+              namespaceSelector:
+                matchExpressions:
+                  - key: platform.thecloudgeek.io/system
+                    operator: Exists
+      validate:
+        failureAction: Enforce
+        allowExistingViolations: false
+        message: >-
+          A cloud object here carries the label
+          platform.thecloudgeek.io/system with this namespace's name. The
+          platform's charts render it; an object made by hand has no such label.
+        deny:
+          conditions:
+            any:
+              - key: "{{ request.object.metadata.labels.\"platform.thecloudgeek.io/system\" || '' }}"
+                operator: NotEquals
+                value: "{{ request.namespace }}"
+
+    # ---------------------------------------------------------------------
+    - name: route-objects-carry-the-system-label
+      skipBackgroundRequests: true
+      match:
+        any:
+          - resources:
+              kinds:
+                - "networking.k8s.io/*/Ingress"
+                - "gateway.networking.k8s.io/*/*"
+                - "networking.gke.io/*/GCPBackendPolicy"
+                - "networking.gke.io/*/HealthCheckPolicy"
+                - "networking.gke.io/*/GCPGatewayPolicy"
+                - "networking.gke.io/*/GCPSessionAffinityPolicy"
+                - "networking.gke.io/*/GCPTrafficDistributionPolicy"
+                - "networking.gke.io/*/LBPolicy"
+              operations:
+                - CREATE
+                - UPDATE
+              namespaceSelector:
+                matchExpressions:
+                  - key: platform.thecloudgeek.io/system
+                    operator: Exists
+      validate:
+        failureAction: Enforce
+        allowExistingViolations: false
+        message: >-
+          A route object here carries the label
+          platform.thecloudgeek.io/system with this namespace's name. The
+          platform's chart renders it from a route file in edge-config; an
+          object made by hand has no such label.
+        deny:
+          conditions:
+            any:
+              - key: "{{ request.object.metadata.labels.\"platform.thecloudgeek.io/system\" || '' }}"
+                operator: NotEquals
+                value: "{{ request.namespace }}"

@@ -119,6 +119,7 @@
           "not": {
             "enum": [
               "argocd",
+              "edge",
               "default",
               "kyverno",
               "systems",
@@ -141,7 +142,7 @@
       ]
     },
     "environment": {
-      "description": "The environment's facts, from platform-config/environments/<env>.yaml. Every key is required and non-empty (ADR-0017 §8). This definition is identical in charts/system and charts/claims; CI checks that.",
+      "description": "The environment's facts, from platform-config/environments/<env>.yaml. Every key is required and non-empty (ADR-0017 §8). This definition is identical in charts/system, charts/claims and charts/route; CI checks that.",
       "type": "object",
       "additionalProperties": false,
       "required": [
@@ -154,7 +155,11 @@
         "registryBase",
         "dockerHubRemote",
         "platformConfigRepo",
-        "platformRevision"
+        "platformRevision",
+        "externalZone",
+        "internalZone",
+        "externalAddress",
+        "internalAddress"
       ],
       "properties": {
         "projectID": {
@@ -196,6 +201,22 @@
         "platformRevision": {
           "type": "string",
           "pattern": "^[A-Za-z0-9][A-Za-z0-9._/-]*$"
+        },
+        "externalZone": {
+          "type": "string",
+          "pattern": "^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$"
+        },
+        "internalZone": {
+          "type": "string",
+          "pattern": "^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$"
+        },
+        "externalAddress": {
+          "type": "string",
+          "pattern": "^[a-z]([-a-z0-9]*[a-z0-9])?$"
+        },
+        "internalAddress": {
+          "type": "string",
+          "pattern": "^[a-z]([-a-z0-9]*[a-z0-9])?$"
         }
       }
     }

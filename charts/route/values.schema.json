@@ -1,0 +1,149 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "One route file, merged with the platform's facts",
+  "description": "This schema is a security boundary (ADR-0021 \u00a72). It sees the merged values: the route file from edge-config, plus the platform and environment objects the platform adds. The file's own top level is closed to host, service, port and path. `platform` and `environment` are in the merged tree because the platform writes them, so a file that sets `exposure`, `system` or `route` at its top level is refused as an unknown key: Helm merges value files key by key and this schema sees only the merged tree, so a top-level `exposure` beside the platform's `platform.exposure` would otherwise be overridden in silence, not refused (ADR-0021 \u00a72, ADR-0017 \u00a74). Every level is closed.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "host",
+    "service",
+    "port",
+    "platform",
+    "environment"
+  ],
+  "properties": {
+    "host": {
+      "description": "A service-class label. The hostname is <host>.<zone>, where the zone comes from the folder (ADR-0021 \u00a72, \u00a73).",
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]{0,30}[a-z0-9]$"
+    },
+    "service": {
+      "description": "A Service in the System's namespace.",
+      "type": "string",
+      "maxLength": 63,
+      "pattern": "^[a-z]([a-z0-9-]*[a-z0-9])?$"
+    },
+    "port": {
+      "description": "The Service's port, an integer.",
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 65535
+    },
+    "path": {
+      "description": "A path prefix. Defaults to / (the default lives in the template: Helm does not apply a schema's defaults, ADR-0017 \u00a76).",
+      "type": "string",
+      "maxLength": 128,
+      "pattern": "^/[A-Za-z0-9._~/-]*$"
+    },
+    "platform": {
+      "description": "Written by the platform from the folder the file sits in (ADR-0021 \u00a72). A value you set here is replaced; a key it does not write is refused.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "exposure",
+        "system",
+        "route"
+      ],
+      "properties": {
+        "exposure": {
+          "enum": [
+            "external",
+            "internal"
+          ]
+        },
+        "system": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9-]{4,28}[a-z0-9]$"
+        },
+        "route": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9-]{0,30}[a-z0-9]$"
+        }
+      }
+    },
+    "environment": {
+      "$ref": "#/$defs/environment"
+    }
+  },
+  "$defs": {
+    "environment": {
+      "description": "The environment's facts, from platform-config/environments/<env>.yaml. Every key is required and non-empty (ADR-0017 \u00a78). This definition is identical in charts/system, charts/claims and charts/route; CI checks that.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "projectID",
+        "region",
+        "orgDomain",
+        "gitBase",
+        "network",
+        "registryLocation",
+        "registryBase",
+        "dockerHubRemote",
+        "platformConfigRepo",
+        "platformRevision",
+        "externalZone",
+        "internalZone",
+        "externalAddress",
+        "internalAddress"
+      ],
+      "properties": {
+        "projectID": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9-]{4,28}[a-z0-9]$"
+        },
+        "region": {
+          "type": "string",
+          "pattern": "^[a-z]+-[a-z]+[0-9]+$"
+        },
+        "orgDomain": {
+          "type": "string",
+          "pattern": "^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$"
+        },
+        "gitBase": {
+          "type": "string",
+          "pattern": "^https://[^/\\s]+$"
+        },
+        "network": {
+          "type": "string",
+          "pattern": "^projects/[a-z][a-z0-9-]{4,28}[a-z0-9]/global/networks/[a-z]([a-z0-9-]*[a-z0-9])?$"
+        },
+        "registryLocation": {
+          "type": "string",
+          "pattern": "^[a-z]+(-[a-z]+[0-9]+)?$"
+        },
+        "registryBase": {
+          "type": "string",
+          "pattern": "^[a-z0-9-]+-docker\\.pkg\\.dev/[a-z][a-z0-9-]{4,28}[a-z0-9]$"
+        },
+        "dockerHubRemote": {
+          "type": "string",
+          "pattern": "^[a-z0-9-]+-docker\\.pkg\\.dev/[a-z][a-z0-9-]{4,28}[a-z0-9]/[a-z]([a-z0-9-]*[a-z0-9])?$"
+        },
+        "platformConfigRepo": {
+          "type": "string",
+          "pattern": "^https://[^\\s]+[^/\\s]$"
+        },
+        "platformRevision": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._/-]*$"
+        },
+        "externalZone": {
+          "type": "string",
+          "pattern": "^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$"
+        },
+        "internalZone": {
+          "type": "string",
+          "pattern": "^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$"
+        },
+        "externalAddress": {
+          "type": "string",
+          "pattern": "^[a-z]([-a-z0-9]*[a-z0-9])?$"
+        },
+        "internalAddress": {
+          "type": "string",
+          "pattern": "^[a-z]([-a-z0-9]*[a-z0-9])?$"
+        }
+      }
+    }
+  }
+}

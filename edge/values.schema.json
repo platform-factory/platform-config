@@ -1,0 +1,96 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "The edge: namespace and Gateways, with the environment's facts",
+  "description": "The platform's own edge (ADR-0021 \u00a74). The only input is the environment's facts, from platform-config/environments/<env>.yaml, so the file is closed to `environment`.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "environment"
+  ],
+  "properties": {
+    "environment": {
+      "$ref": "#/$defs/environment"
+    }
+  },
+  "$defs": {
+    "environment": {
+      "description": "The environment's facts, from platform-config/environments/<env>.yaml. Every key is required and non-empty (ADR-0017 \u00a78). This definition is identical in charts/system, charts/claims and charts/route; CI checks that.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "projectID",
+        "region",
+        "orgDomain",
+        "gitBase",
+        "network",
+        "registryLocation",
+        "registryBase",
+        "dockerHubRemote",
+        "platformConfigRepo",
+        "platformRevision",
+        "externalZone",
+        "internalZone",
+        "externalAddress",
+        "internalAddress"
+      ],
+      "properties": {
+        "projectID": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9-]{4,28}[a-z0-9]$"
+        },
+        "region": {
+          "type": "string",
+          "pattern": "^[a-z]+-[a-z]+[0-9]+$"
+        },
+        "orgDomain": {
+          "type": "string",
+          "pattern": "^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$"
+        },
+        "gitBase": {
+          "type": "string",
+          "pattern": "^https://[^/\\s]+$"
+        },
+        "network": {
+          "type": "string",
+          "pattern": "^projects/[a-z][a-z0-9-]{4,28}[a-z0-9]/global/networks/[a-z]([a-z0-9-]*[a-z0-9])?$"
+        },
+        "registryLocation": {
+          "type": "string",
+          "pattern": "^[a-z]+(-[a-z]+[0-9]+)?$"
+        },
+        "registryBase": {
+          "type": "string",
+          "pattern": "^[a-z0-9-]+-docker\\.pkg\\.dev/[a-z][a-z0-9-]{4,28}[a-z0-9]$"
+        },
+        "dockerHubRemote": {
+          "type": "string",
+          "pattern": "^[a-z0-9-]+-docker\\.pkg\\.dev/[a-z][a-z0-9-]{4,28}[a-z0-9]/[a-z]([a-z0-9-]*[a-z0-9])?$"
+        },
+        "platformConfigRepo": {
+          "type": "string",
+          "pattern": "^https://[^\\s]+[^/\\s]$"
+        },
+        "platformRevision": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._/-]*$"
+        },
+        "externalZone": {
+          "type": "string",
+          "pattern": "^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$"
+        },
+        "internalZone": {
+          "type": "string",
+          "pattern": "^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$"
+        },
+        "externalAddress": {
+          "type": "string",
+          "pattern": "^[a-z]([-a-z0-9]*[a-z0-9])?$"
+        },
+        "internalAddress": {
+          "type": "string",
+          "pattern": "^[a-z]([-a-z0-9]*[a-z0-9])?$"
+        }
+      }
+    }
+  }
+}

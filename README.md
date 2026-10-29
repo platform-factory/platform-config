@@ -23,7 +23,9 @@ apps/                          one Application per component — the root syncs 
 ├── kyverno.yaml               wave 2: Kyverno, Helm chart rendered from charts/kyverno
 ├── compositions.yaml          wave 3: everything under crossplane/compositions/, recursively
 ├── kyverno-policies.yaml      wave 3: everything under kyverno/policies/
-└── systems.yaml               wave 4: the tenants — a DIFFERENT repo, github.com/platform-factory/systems, path tenants/
+├── edge.yaml                  wave 4: the namespace `edge` and the two Gateways, rendered from edge/ (ADR-0021 §4)
+├── systems.yaml               wave 4: the tenants — a DIFFERENT repo, github.com/platform-factory/systems, path tenants/
+└── edge-routes.yaml           wave 5: the `edge` project and the two ApplicationSets that render edge-config's route files (ADR-0021 §2, §3)
 charts/
 ├── crossplane/                vendored upstream chart 2.3.5, unmodified (see charts/README.md)
 └── kyverno/                   vendored upstream chart 3.9.2, unmodified (see charts/README.md)
@@ -34,7 +36,7 @@ crossplane/
     ├── system/                XRD + Composition + a non-applied example for `crossplane render`
     └── database/              XRD + Composition + a non-applied example for `crossplane render`
 kyverno/
-└── policies/                  the two validate-only ClusterPolicies, plus the read grant one of them needs
+└── policies/                  the validate-only ClusterPolicies: deny-raw and keep-abandon (M2), deny-edge-objects and require-system-label (ADR-0021 §9)
 ```
 
 ## Values you must change to run this somewhere else

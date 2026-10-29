@@ -1,0 +1,4 @@
+# Deliberately empty. The only input is the environment's facts, passed by
+# apps/edge.yaml as the value file ../environments/reference.yaml; see
+# charts/route/values.yaml for why a chart's own values.yaml carries nothing
+# (ADR-0017 §6).
