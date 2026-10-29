@@ -46,6 +46,7 @@ never against a live cluster.
 | Object | Where | Notes |
 |---|---|---|
 | `Namespace` | `<name>` | `Prune=false`, so a chart change that stopped rendering it cannot delete it (ADR-0019 §1); carries the project annotation Config Connector falls back to |
+| `NetworkPolicy` `platform-default-deny`, `platform-allow` | `<name>` | C-34: no traffic in or out except the golden path's allow list (ADR-0021 §15); the namespace also carries Pod Security labels, `baseline` enforced and `restricted` warned and audited |
 | `ResourceQuota` | `<name>` | from the size class; makes CPU and memory limits mandatory for every container |
 | `RoleBinding` `<name>-admin` | `<name>` | the team's Google Group gets the built-in `admin` role |
 | `ServiceAccount` `<name>` | `<name>` | the System's Kubernetes identity, mapped to its Google one |
