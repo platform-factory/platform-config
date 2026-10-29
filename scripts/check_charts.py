@@ -375,6 +375,7 @@ def check_real_tenants(systems, environment):
         check_no_policy_from_git(objects, name)
         check_no_edge_from_git(objects, name)
         check_isolation(objects, environment, name)
+        check_iam_members_literal(objects, name)
 
 
 def check_no_policy_from_git(objects, label):
@@ -397,6 +398,56 @@ def check_cnrm_annotations(objects, label):
         if obj["kind"] in DURABLE_KINDS and annotations.get("cnrm.cloud.google.com/deletion-policy") != "abandon":
             missing.append("cnrm.cloud.google.com/deletion-policy: abandon")
         report(not missing, f"  {label}: {obj['kind']} {obj['metadata']['name']} carries its annotations" + (f" (missing {missing})" if missing else ""))
+
+
+# ADR-0022 §5: a platform chart names IAM members literally. An IAM member
+# taken from memberFrom.serviceAccountRef is read from the referenced
+# IAMServiceAccount's status.email [C, k8s-config-connector v1.156.0
+# pkg/controller/iam/iamclient/tfiamclient.go L658-670, L730-744], and a team
+# can write its own objects' /status: RBAC's admin covers the subresource and
+# Kyverno's webhook does not see it. IAMPartialPolicy and IAMPolicy carry the
+# same memberFrom form, and the platform's charts use neither kind.
+IAM_KINDS_NOT_USED = {"IAMPartialPolicy", "IAMPolicy"}
+
+
+def iam_member_problems(objects):
+    problems = []
+    for obj in objects:
+        if not obj.get("apiVersion", "").startswith("iam.cnrm.cloud.google.com/"):
+            continue
+        name = f"{obj['kind']} {obj['metadata']['name']}"
+        if obj["kind"] in IAM_KINDS_NOT_USED:
+            problems.append(f"{name}: a kind the platform's charts do not use")
+        elif obj["kind"] == "IAMPolicyMember":
+            spec = obj.get("spec", {})
+            if "memberFrom" in spec or not isinstance(spec.get("member"), str):
+                problems.append(f"{name}: the member must be a literal string, not memberFrom")
+    return problems
+
+
+def check_iam_members_literal(objects, label):
+    problems = iam_member_problems(objects)
+    report(not problems, f"  {label}: every IAM member is named literally (ADR-0022 §5)" + (f": {problems}" if problems else ""))
+
+
+def check_iam_member_rule_can_fail():
+    """The rule has to be seen to refuse (ADR-0019 §4), and the claims chart's
+    grants are not in a real tenant's system render, so the charts' text is
+    scanned too."""
+    bad = {
+        "memberFrom.serviceAccountRef": {"kind": "IAMPolicyMember", "spec": {"memberFrom": {"serviceAccountRef": {"name": "other"}}, "role": "roles/iam.workloadIdentityUser"}},
+        "an IAMPartialPolicy": {"kind": "IAMPartialPolicy", "spec": {}},
+    }
+    for what, obj in bad.items():
+        obj = {"apiVersion": "iam.cnrm.cloud.google.com/v1beta1", "metadata": {"name": "mutant"}, **obj}
+        report(bool(iam_member_problems([obj])), f"the literal-member rule refuses {what}")
+    found = []
+    for folder in (CHARTS / "system", CHARTS / "claims", CHARTS / "route", REPO / "edge"):
+        for path in sorted(folder.rglob("*")) if folder.exists() else []:
+            if path.is_file() and path.suffix in {".yaml", ".tpl"}:
+                text = "\n".join(line for line in path.read_text().splitlines() if not line.lstrip().startswith(("#", "{{/*", "{{- /*")))
+                found += [f"{path.relative_to(REPO)}: {word}" for word in ("memberFrom", "IAMPartialPolicy", "kind: IAMPolicy\n") if word in text + "\n"]
+    report(not found, "no chart uses memberFrom, IAMPartialPolicy or IAMPolicy" + (f": {found}" if found else ""))
 
 
 def check_svc_hello_matches_live(systems, environment):
@@ -1151,6 +1202,8 @@ def main():
     check_tenant_values_change_nothing(environment)
     print("\n== the real tenant files")
     check_real_tenants(args.systems, environment)
+    print("\n== IAM members are named literally (ADR-0022 §5)")
+    check_iam_member_rule_can_fail()
     print("\n== svc-hello's database renders what is live")
     check_svc_hello_matches_live(args.systems, environment)
     print("\n== the root app-of-apps")
