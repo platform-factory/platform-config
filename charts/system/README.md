@@ -30,7 +30,7 @@ It carries the System XRD's rules unchanged and refuses more names
 | Refused | Why |
 |---|---|
 | a name ending in `-system` or `-claims` | every tenant's three Applications share the `argocd` namespace: System `orders` owns `orders-claims`, which would also be the tenant Application of a System named `orders-claims` |
-| `argocd`, `default`, `kyverno`, and any name starting `kube-`, `gke-`, `gmp-`, `cnrm-` or `configconnector-` | namespaces the platform or GKE already uses: the chart would bind the team as `admin` there, and offboarding would delete it |
+| `argocd`, `edge`, `default`, `kyverno`, and any name starting `kube-`, `gke-`, `gmp-`, `cnrm-` or `configconnector-` | namespaces the platform or GKE already uses: the chart would bind the team as `admin` there, and offboarding would delete it |
 | `systems`, `config-connector`, `kyverno-policies`, and the Crossplane-era `crossplane`, `crossplane-providers`, `crossplane-platform`, `compositions` | platform Applications in `argocd`, which a tenant Application of the same name would overwrite |
 | `jumpbox`, `crossplane-provider-gcp`, `config-connector` (and `gke-nodes`, by prefix) | Google service accounts the platform's Terraform creates: the chart would adopt the account by name and bind it to the tenant's pods |
 | `docker-hub`, `quay-io`, `ghcr-io`, `ecr-public`, `registry-k8s-io` | Artifact Registry repositories the platform's Terraform creates: the chart would try to make one the tenant's registry |

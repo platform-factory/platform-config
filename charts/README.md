@@ -3,7 +3,8 @@
 Two kinds of chart live here.
 
 **The platform's own charts**, from M2b (ADR-0017): `system/`, everything one
-tenant gets, and `claims/`, a service's databases. Each has its own README.
+tenant gets, and `claims/`, a service's databases; and from M3a (ADR-0021 §2),
+`route/`, one route file from `edge-config`. Each has its own README.
 They are the recipes, and `scripts/check_charts.py` renders and tests them on
 every pull request.
 
