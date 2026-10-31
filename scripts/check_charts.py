@@ -1014,6 +1014,7 @@ def expected_egress(environment):
     env = environment["environment"]
     return [
         ("kube-dns", [("UDP", 53), ("TCP", 53)]),
+        ("node-local-dns", [("UDP", 53), ("TCP", 53)]),
         ("169.254.169.254/32", [("TCP", 80), ("TCP", 8080)]),
         (env["privateServicesRange"], [("TCP", 3307), ("TCP", 5432)]),
         ("0.0.0.0/0", [("TCP", 443)]),
@@ -1053,6 +1054,8 @@ def isolation_problems(objects, environment):
                 problems.append(f"egress to {where} has an `except`; the list says none")
         elif destination.get("podSelector", {}).get("matchLabels") == {"k8s-app": "kube-dns"} and destination.get("namespaceSelector", {}).get("matchLabels") == {"kubernetes.io/metadata.name": "kube-system"}:
             where = "kube-dns"
+        elif destination.get("podSelector", {}).get("matchLabels") == {"k8s-app": "node-local-dns"} and destination.get("namespaceSelector", {}).get("matchLabels") == {"kubernetes.io/metadata.name": "kube-system"}:
+            where = "node-local-dns"
         else:
             where = f"unrecognised {destination}"
         found.append((where, [(p["protocol"], p["port"]) for p in rule.get("ports", [])]))
@@ -1082,10 +1085,11 @@ def check_isolation(objects, environment, label, mutations=False):
         "a default-deny for ingress only": lambda os: policy(os, "platform-default-deny")["spec"].update(policyTypes=["Ingress"]),
         "a default-deny that allows something": lambda os: policy(os, "platform-default-deny")["spec"].update(egress=[{}]),
         "a default-deny that selects some pods": lambda os: policy(os, "platform-default-deny")["spec"].update(podSelector={"matchLabels": {"app": "x"}}),
-        "no metadata-server allow": lambda os: policy(os, "platform-allow")["spec"]["egress"].pop(1),
-        "port 5432 missing": lambda os: policy(os, "platform-allow")["spec"]["egress"][2]["ports"].pop(),
+        "no node-local-dns allow": lambda os: policy(os, "platform-allow")["spec"]["egress"].pop(1),
+        "no metadata-server allow": lambda os: policy(os, "platform-allow")["spec"]["egress"].pop(2),
+        "port 5432 missing": lambda os: policy(os, "platform-allow")["spec"]["egress"][3]["ports"].pop(),
         "an extra egress to anywhere": lambda os: policy(os, "platform-allow")["spec"]["egress"].append({"to": [{"ipBlock": {"cidr": "0.0.0.0/0"}}]}),
-        "an extra egress port": lambda os: policy(os, "platform-allow")["spec"]["egress"][3]["ports"].append({"protocol": "TCP", "port": 80}),
+        "an extra egress port": lambda os: policy(os, "platform-allow")["spec"]["egress"][4]["ports"].append({"protocol": "TCP", "port": 80}),
         "no proxy-only ingress": lambda os: policy(os, "platform-allow")["spec"]["ingress"][0]["from"].pop(),
         "an ingress from everywhere": lambda os: policy(os, "platform-allow")["spec"].update(ingress=[{}]),
         "an ingress from another namespace": lambda os: policy(os, "platform-allow")["spec"]["ingress"].append({"from": [{"namespaceSelector": {}}]}),
