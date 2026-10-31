@@ -5,6 +5,9 @@ WHAT EACH CLAIM GETS
   SQLInstance    <system>-<claim>           private IP only, IAM login on    durable
   SQLDatabase    <system>-<claim>-app       the database the app uses        durable
   SQLUser        <system>-<claim>-iam-user  the app's identity as a role     durable
+  IAMPolicyMember (x4)      roles/cloudsql.client and .instanceUser, for the app's
+                 service account and for the team's group, each on this
+                 instance only (ADR-0021 §14)
   ConfigMap      <claim>-connection         what the app needs to connect
   Job            <claim>-seed-<hash>        creates <claim>-admin once
   Job            <claim>-grant-<hash>       gives the IAM user its privileges
@@ -65,6 +68,9 @@ instance is regional (ADR-0017 §5).
        ".gserviceaccount.com" (ADR-0013). The System's service account is named
        after the System (charts/system). */ -}}
 {{- $iamUser := printf "%s@%s.iam" $ns $project }}
+{{- $team := $.Values.system.team }}
+{{- $group := printf "%s@%s" $team (include "claims.env" (list $.Values "orgDomain")) }}
+{{- $gsa := printf "%s@%s.iam.gserviceaccount.com" $ns $project }}
 ---
 apiVersion: sql.cnrm.cloud.google.com/v1beta1
 kind: SQLInstance
@@ -167,6 +173,82 @@ spec:
   # No password anywhere: Cloud SQL authenticates this user from a short-lived
   # token minted from the pod's Google identity (ADR-0013 §2).
   type: CLOUD_IAM_SERVICE_ACCOUNT
+{{- /*
+THE CLOUD SQL LOGIN GRANTS (ADR-0013 §1 and §5; ADR-0021 §14; C-24): two roles
+for two principals, on THIS instance and no other.
+  roles/cloudsql.client        connect, through the Auth Proxy
+  roles/cloudsql.instanceUser  log in as an IAM database user
+The System's service account is how the application connects; the team's group
+is how a person does. Both roles can be granted no lower than the project, so
+the grant is a project-level binding with an IAM Condition that names the
+instance exactly. That is exact only because a claim's key has no hyphen: the
+instance name <system>-<claim> is then the whole of what follows
+"projects/<project>/instances/", and System `orders` no longer matches
+`orders-api-main`, which ADR-0016 §2's name prefix did.
+
+A binding's identity is its member, role and condition together, so these are
+new bindings beside the unconditioned ones charts/system rendered in M2b
+(ADR-0017 §10): nothing is adopted. When this merges on a live cluster, Argo
+CD prunes those old bindings with charts/system's Application, and C-24's
+connect test reads the cloud side to confirm none is left. (On a rebuilt
+cluster nothing would prune them: they would be orphaned in the project's IAM
+policy.) Between that prune and the creation of the conditioned bindings by
+charts/claims' Application there is a window with no Cloud SQL grant.
+
+An IAM member's fields cannot change, and the API server refuses an edit
+(ADR-0017 §10). So a member whose principal can change, the team's, has the
+team in its NAME: a team move renders new members and Argo CD prunes the old
+ones. Removing a claim prunes its grants and leaves the instance (it is
+durable).
+
+IAM allows at most 20 bindings with one role and principal under different
+conditions, so a team covers at most 20 databases per role (ADR-0021,
+Consequences). This chart's limit is two databases per System.
+*/}}
+{{- $condition := printf "resource.name == \"projects/%s/instances/%s\"" $project $instance }}
+{{- $roles := dict "sql-client" "roles/cloudsql.client" "sql-instance-user" "roles/cloudsql.instanceUser" }}
+{{- range $roleName, $role := $roles }}
+---
+apiVersion: iam.cnrm.cloud.google.com/v1beta1
+kind: IAMPolicyMember
+metadata:
+  name: {{ printf "%s-%s-app" $instance $roleName }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "claims.labels" (list $ns $claim) | nindent 4 }}
+  annotations:
+    {{- include "claims.cnrmAnnotations" $project | nindent 4 }}
+spec:
+  resourceRef:
+    kind: Project
+    external: {{ printf "projects/%s" $project | quote }}
+  role: {{ $role }}
+  member: {{ printf "serviceAccount:%s" $gsa | quote }}
+  condition:
+    title: {{ $instance | quote }}
+    description: {{ printf "%s on the instance %s only (C-24)" $role $instance | quote }}
+    expression: {{ $condition | quote }}
+---
+apiVersion: iam.cnrm.cloud.google.com/v1beta1
+kind: IAMPolicyMember
+metadata:
+  name: {{ printf "%s-%s-team-%s" $instance $roleName $team }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "claims.labels" (list $ns $claim) | nindent 4 }}
+  annotations:
+    {{- include "claims.cnrmAnnotations" $project | nindent 4 }}
+spec:
+  resourceRef:
+    kind: Project
+    external: {{ printf "projects/%s" $project | quote }}
+  role: {{ $role }}
+  member: {{ printf "group:%s" $group | quote }}
+  condition:
+    title: {{ $instance | quote }}
+    description: {{ printf "%s on the instance %s only (C-24)" $role $instance | quote }}
+    expression: {{ $condition | quote }}
+{{- end }}
 ---
 # What the application needs to connect. Nothing here is secret: connecting is
 # an IAM question, not a credential question. The private IP is not here,
