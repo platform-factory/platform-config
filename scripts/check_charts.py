@@ -78,6 +78,13 @@ What it checks
      with the namespace; and every real tenant's AppProject refuses the same
      kinds from git.
 
+ 11. C-34: every real tenant's Namespace carries Pod Security `baseline`
+     enforced and `restricted` warned and audited, all three versions pinned
+     to environment.podSecurityVersion; it has a default-deny NetworkPolicy
+     that selects every pod and allows nothing, and an allow list that is
+     exactly platform-config#21's egress plus the three ingress ranges
+     (ADR-0021 §15). The check first proves it can fail.
+
 How to run it
 -------------
   HELM=/path/to/helm-3.19.x python3 scripts/check_charts.py --systems ../systems
@@ -367,6 +374,7 @@ def check_real_tenants(systems, environment):
         report(set(values_object(output, name)["environment"]) == env_keys, f"  {name}: the claims Application's valuesObject writes every environment key")
         check_no_policy_from_git(objects, name)
         check_no_edge_from_git(objects, name)
+        check_isolation(objects, environment, name)
         check_iam_members_literal(objects, name)
 
 
@@ -995,6 +1003,111 @@ def check_edge_git_door_can_fail():
         report(found == [f"{entry[0]}/{entry[1]}"], f"  the git-door check names {entry[0]}/{entry[1]} when it is missing")
 
 
+# M3b: C-34, tenant isolation by default (ADR-0021 §15)
+# ---------------------------------------------------------------------------
+
+PSS_LEVELS = {"enforce": "baseline", "warn": "restricted", "audit": "restricted"}
+GOOGLE_RANGES = ["130.211.0.0/22", "35.191.0.0/16"]
+# platform-config#21's allow list: (destination, ports). Written out here, not
+# read back from the template, so a change to the template shows as a failure.
+def expected_egress(environment):
+    env = environment["environment"]
+    return [
+        ("kube-dns", [("UDP", 53), ("TCP", 53)]),
+        ("169.254.169.254/32", [("TCP", 80), ("TCP", 8080)]),
+        (env["privateServicesRange"], [("TCP", 3307), ("TCP", 5432)]),
+        ("0.0.0.0/0", [("TCP", 443)]),
+    ]
+
+
+def isolation_problems(objects, environment):
+    """C-34, as ADR-0021 §15 and platform-config#21 describe it. Returns the
+    problems found; none means the tenant namespace is isolated by default."""
+    env = environment["environment"]
+    problems = []
+    namespace = next((o for o in objects if o["kind"] == "Namespace"), None)
+    labels = (namespace or {}).get("metadata", {}).get("labels", {})
+    for mode, level in PSS_LEVELS.items():
+        if labels.get(f"pod-security.kubernetes.io/{mode}") != level:
+            problems.append(f"the Namespace must set pod-security.kubernetes.io/{mode}: {level}, found {labels.get(f'pod-security.kubernetes.io/{mode}')!r}")
+        if labels.get(f"pod-security.kubernetes.io/{mode}-version") != env["podSecurityVersion"]:
+            problems.append(f"pod-security.kubernetes.io/{mode}-version must be the pinned {env['podSecurityVersion']!r}, found {labels.get(f'pod-security.kubernetes.io/{mode}-version')!r}")
+    policies = {o["metadata"]["name"]: o for o in objects if o["kind"] == "NetworkPolicy"}
+    if sorted(policies) != ["platform-allow", "platform-default-deny"]:
+        return problems + [f"expected NetworkPolicies platform-allow and platform-default-deny, found {sorted(policies)}"]
+    deny = policies["platform-default-deny"]["spec"]
+    if deny.get("podSelector") != {} or sorted(deny.get("policyTypes", [])) != ["Egress", "Ingress"] or "ingress" in deny or "egress" in deny:
+        problems.append("platform-default-deny must select every pod, cover both directions and allow nothing")
+    allow = policies["platform-allow"]["spec"]
+    if allow.get("podSelector") != {} or sorted(allow.get("policyTypes", [])) != ["Egress", "Ingress"]:
+        problems.append("platform-allow must select every pod and cover both directions")
+    found = []
+    for rule in allow.get("egress", []):
+        if len(rule.get("to", [])) != 1:
+            problems.append(f"an egress rule must have exactly one destination, found {rule.get('to')}")
+            continue
+        destination = rule["to"][0]
+        if "ipBlock" in destination:
+            where = destination["ipBlock"]["cidr"]
+            if "except" in destination["ipBlock"]:
+                problems.append(f"egress to {where} has an `except`; the list says none")
+        elif destination.get("podSelector", {}).get("matchLabels") == {"k8s-app": "kube-dns"} and destination.get("namespaceSelector", {}).get("matchLabels") == {"kubernetes.io/metadata.name": "kube-system"}:
+            where = "kube-dns"
+        else:
+            where = f"unrecognised {destination}"
+        found.append((where, [(p["protocol"], p["port"]) for p in rule.get("ports", [])]))
+    if found != expected_egress(environment):
+        problems.append(f"the egress allow list must be exactly {expected_egress(environment)}, found {found}")
+    ingress = allow.get("ingress", [])
+    sources = [f["ipBlock"]["cidr"] for rule in ingress for f in rule.get("from", []) if "ipBlock" in f]
+    if len(ingress) != 1 or "ports" in ingress[0] or sources != GOOGLE_RANGES + [env["proxyOnlyRange"]]:
+        problems.append(f"the ingress allow list must be exactly {GOOGLE_RANGES + [env['proxyOnlyRange']]} from the load balancers, found {sources}")
+    return problems
+
+
+def check_isolation(objects, environment, label, mutations=False):
+    found = isolation_problems(objects, environment)
+    report(not found, f"  {label}: its namespace is isolated by default (Pod Security labels, default-deny, allow list)" + (f": {found}" if found else ""))
+    if not mutations:
+        return
+
+    def policy(os, name):
+        return next(o for o in os if o["kind"] == "NetworkPolicy" and o["metadata"]["name"] == name)
+
+    edits = {
+        "enforce at restricted": lambda os: os[0]["metadata"]["labels"].update({"pod-security.kubernetes.io/enforce": "restricted"}),
+        "no enforce label": lambda os: os[0]["metadata"]["labels"].pop("pod-security.kubernetes.io/enforce"),
+        "an unpinned version": lambda os: os[0]["metadata"]["labels"].update({"pod-security.kubernetes.io/audit-version": "latest"}),
+        "no default-deny": lambda os: os.remove(policy(os, "platform-default-deny")),
+        "a default-deny for ingress only": lambda os: policy(os, "platform-default-deny")["spec"].update(policyTypes=["Ingress"]),
+        "a default-deny that allows something": lambda os: policy(os, "platform-default-deny")["spec"].update(egress=[{}]),
+        "a default-deny that selects some pods": lambda os: policy(os, "platform-default-deny")["spec"].update(podSelector={"matchLabels": {"app": "x"}}),
+        "no metadata-server allow": lambda os: policy(os, "platform-allow")["spec"]["egress"].pop(1),
+        "port 5432 missing": lambda os: policy(os, "platform-allow")["spec"]["egress"][2]["ports"].pop(),
+        "an extra egress to anywhere": lambda os: policy(os, "platform-allow")["spec"]["egress"].append({"to": [{"ipBlock": {"cidr": "0.0.0.0/0"}}]}),
+        "an extra egress port": lambda os: policy(os, "platform-allow")["spec"]["egress"][3]["ports"].append({"protocol": "TCP", "port": 80}),
+        "no proxy-only ingress": lambda os: policy(os, "platform-allow")["spec"]["ingress"][0]["from"].pop(),
+        "an ingress from everywhere": lambda os: policy(os, "platform-allow")["spec"].update(ingress=[{}]),
+        "an ingress from another namespace": lambda os: policy(os, "platform-allow")["spec"]["ingress"].append({"from": [{"namespaceSelector": {}}]}),
+    }
+    for what, edit in edits.items():
+        copied = copy.deepcopy(objects)
+        # the Namespace is first in the render only by luck; make it so
+        copied.sort(key=lambda o: o["kind"] != "Namespace")
+        edit(copied)
+        report(bool(isolation_problems(copied, environment)), f"  the isolation check catches {what}")
+
+
+def check_isolation_can_fail(environment):
+    """The isolation check can fail: break a good render in fourteen ways."""
+    tenant = load_fixture_tenant("standard-svc")
+    with tempfile.TemporaryDirectory() as folder:
+        ok, output = render_system(folder, tenant, [], environment)
+    objects = documents(output)
+    report(ok, "standard-svc renders, for the isolation check's mutations")
+    check_isolation(objects, environment, "standard-svc", mutations=True)
+
+
 def check_policies():
     """The reality gate refuses an edit too (ADR-0017 §7).
 
@@ -1106,6 +1219,8 @@ def main():
     print("\n== the edge policies, and the git door")
     check_edge_policies()
     check_edge_git_door_can_fail()
+    print("\n== a tenant namespace is isolated by default (C-34)")
+    check_isolation_can_fail(environment)
     print("\n== the reality gate refuses an edit too")
     check_policies()
     print("\n== a team cannot write Kyverno policy with kubectl")
