@@ -413,7 +413,7 @@ IAM_KINDS_NOT_USED = {"IAMPartialPolicy", "IAMPolicy"}
 def iam_member_problems(objects):
     problems = []
     for obj in objects:
-        if not obj.get("apiVersion", "").startswith("iam.cnrm.cloud.google.com/"):
+        if obj.get("apiVersion", "").split("/", 1)[0] != "iam.cnrm.cloud.google.com":
             continue
         name = f"{obj['kind']} {obj['metadata']['name']}"
         if obj["kind"] in IAM_KINDS_NOT_USED:
