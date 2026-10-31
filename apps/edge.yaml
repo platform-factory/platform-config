@@ -1,0 +1,51 @@
+# The edge — sync wave 4 of the root app-of-apps (ADR-0021 §4).
+#
+# Reads this repo's edge/ directory, a small chart, and creates the namespace
+# `edge` and the two Gateways, `external` and `internal`, that every route
+# attaches to. The routes themselves are rendered by apps/edge-routes.yaml
+# (wave 5), one Application per route file, into the Systems' namespaces.
+#
+# Wave 4, with the tenants: after the Kyverno policies (wave 3), so the
+# reality gate for these kinds is in force before the first Gateway exists, and
+# before the routes (wave 5). It needs the Gateway API CRDs, which GKE installs
+# when layer 2 sets the Gateway API channel to standard (ADR-0021 §12); until
+# the cluster has been rebuilt with it this Application cannot sync, and the
+# retry block waits.
+#
+# The environment's facts are passed as the value file ../environments/
+# reference.yaml, a path outside the chart but inside this repo [I; the first
+# M3 session confirms Argo CD v3.4.6 resolves it]. The Gateways take their
+# reserved addresses from it by name.
+#
+# The project is `default`, the platform's: the Namespace is cluster-scoped.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: edge
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "4"
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/platform-factory/platform-config
+    targetRevision: main
+    path: edge
+    helm:
+      valueFiles:
+        - ../environments/reference.yaml
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: edge
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - ServerSideApply=true
+    retry:
+      limit: 10
+      backoff:
+        duration: 15s
+        factor: 2
+        maxDuration: 5m

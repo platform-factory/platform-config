@@ -17,14 +17,14 @@ as an extra check and never as the gate.
 
 What it checks
 --------------
-  1. The three charts agree with the environment file: the same `environment`
+  1. The four charts agree with the environment file: the same `environment`
      schema in all of them, every key of environments/<env>.yaml required, and
      no value in any chart's values.yaml.
   2. Nothing in charts/ or apps/ turns a gate off: no skipSchemaValidation,
      no allowEmpty (ADR-0017 §6, ADR-0019 §2).
   3. Every case in tests/charts/cases.yaml: each must-fail case is refused,
      with the text it expects; each must-pass case renders.
-  4. Every environment key, deleted and then blanked, stops all three charts, and
+  4. Every environment key, deleted and then blanked, stops all four charts, and
      the refusal names the key (ADR-0017 §8).
   5. A value a claims.yaml sets under `system:` or `environment:` changes
      nothing: the render is byte-identical with and without it, for every key
@@ -51,7 +51,6 @@ What it checks
      chart, rendered with apps/kyverno.yaml's values, aggregates no role into
      `admin`. The second half first proves it can fail: with the chart's
      default it must find the roles it then finds absent.
-
  11. charts/route refuses what ADR-0021 §2 says it refuses, and renders what
      §3 says it renders: every must-fail route case (a top-level `exposure`,
      `system` or `route`, an unknown key, a non-integer port, a host outside
@@ -68,6 +67,16 @@ What it checks
      finalizer is there and nothing stops a delete); and `edge` is a
      reserved System name. Each assertion first proves it can fail, on a
      copy with one thing broken.
+ 13. The Gateways (edge/, rendered with the environment file) are the ones
+     ADR-0021 §4 describes: classes, listeners, addresses from the environment,
+     the certificate map annotation, allowedRoutes by the System label key, in
+     a namespace that carries no System label.
+ 14. The two edge policies (kyverno/policies) are the ones ADR-0021 §9
+     describes: validate-only, failurePolicy Fail, allowExistingViolations
+     false, the Service rule exempting nobody, the route-kind rules exempting
+     exactly the identities §9 names, and the label rule comparing the label
+     with the namespace; and every real tenant's AppProject refuses the same
+     kinds from git.
 
 How to run it
 -------------
@@ -92,7 +101,9 @@ REPO = pathlib.Path(__file__).resolve().parent.parent
 CHARTS = REPO / "charts"
 ENV_FILE = REPO / "environments" / "reference.yaml"
 CASES = REPO / "tests" / "charts" / "cases.yaml"
-SCHEMA_CHARTS = ("system", "claims", "route")
+# The platform's own edge is a chart too, but it lives in edge/ (ADR-0021 §4).
+CHART_DIRS = {"edge": REPO / "edge"}
+SCHEMA_CHARTS = ("system", "claims", "route", "edge")
 FIXTURE_TENANTS = REPO / "tests" / "charts" / "tenants"
 HELM = os.environ.get("HELM", "helm")
 
@@ -121,9 +132,13 @@ def report(ok, message):
 # Rendering, the way Argo CD does it
 # ---------------------------------------------------------------------------
 
+def chart_dir(chart):
+    return CHART_DIRS.get(chart, CHARTS / chart)
+
+
 def helm_template(chart, release, namespace, value_files):
     """Run `helm template`. Returns (ok, stdout or stderr)."""
-    command = [HELM, "template", release, str(CHARTS / chart), "--namespace", namespace]
+    command = [HELM, "template", release, str(chart_dir(chart)), "--namespace", namespace]
     for path in value_files:
         command += ["-f", str(path)]
     result = subprocess.run(command, capture_output=True, text=True)
@@ -187,6 +202,12 @@ def render_route(folder, route, platform, environment, namespace=None):
     return helm_template("route", "route", namespace or platform["system"], files)
 
 
+def render_edge(folder, environment):
+    """Render edge/ the way apps/edge.yaml makes Argo CD do it: the environment
+    file is its only value file."""
+    return helm_template("edge", "edge", "edge", [write_yaml(folder, "environment.yaml", environment)])
+
+
 def load_env():
     return yaml.safe_load(ENV_FILE.read_text())
 
@@ -228,23 +249,23 @@ def run_case(case, environment):
 # ---------------------------------------------------------------------------
 
 def check_consistency(environment):
-    schemas = {c: json.loads((CHARTS / c / "values.schema.json").read_text()) for c in SCHEMA_CHARTS}
+    schemas = {c: json.loads((chart_dir(c) / "values.schema.json").read_text()) for c in SCHEMA_CHARTS}
     env_schema = schemas["claims"]["$defs"]["environment"]
     report(
         all(s["$defs"]["environment"] == env_schema for s in schemas.values()),
-        "all three charts carry the same environment schema",
+        "all four charts carry the same environment schema",
     )
     keys = set(environment["environment"])
     report(set(env_schema["required"]) == keys, "every key of environments/reference.yaml is required by the schema, and no other")
     report(set(env_schema["properties"]) == keys, "the environment schema lists exactly the environment file's keys")
     for chart in SCHEMA_CHARTS:
-        values = yaml.safe_load((CHARTS / chart / "values.yaml").read_text())
-        report(not values, f"charts/{chart}/values.yaml carries no value")
+        values = yaml.safe_load((chart_dir(chart) / "values.yaml").read_text())
+        report(not values, f"{chart_dir(chart).relative_to(REPO)}/values.yaml carries no value")
 
 
 def check_no_off_switches():
     found = []
-    for folder in (CHARTS / "system", CHARTS / "claims", CHARTS / "route", REPO / "apps"):
+    for folder in (CHARTS / "system", CHARTS / "claims", CHARTS / "route", REPO / "edge", REPO / "apps"):
         for path in sorted(folder.rglob("*")) if folder.exists() else []:
             if path.is_file() and path.suffix in {".yaml", ".tpl", ".json"}:
                 text = path.read_text()
@@ -296,9 +317,10 @@ def check_environment_keys(environment):
                 ok_s, out_s = render_system(folder, tenant, [], env)
                 ok_c, out_c = render_claims(folder, "standard-svc", None, vo)
                 ok_r, out_r = render_route(folder, ROUTE_FILE, ROUTE_PLATFORM, env, "svc-hello")
+                ok_e, out_e = render_edge(folder, env)
             report(
-                not ok_s and key in out_s and not ok_c and key in out_c and not ok_r and key in out_r,
-                f"environment.{key} {how}: all three charts refuse, naming it",
+                not ok_s and key in out_s and not ok_c and key in out_c and not ok_r and key in out_r and not ok_e and key in out_e,
+                f"environment.{key} {how}: all four charts refuse, naming it",
             )
 
 
@@ -344,6 +366,8 @@ def check_real_tenants(systems, environment):
         check_cnrm_annotations(objects, name)
         report(set(values_object(output, name)["environment"]) == env_keys, f"  {name}: the claims Application's valuesObject writes every environment key")
         check_no_policy_from_git(objects, name)
+        check_no_edge_from_git(objects, name)
+        check_iam_members_literal(objects, name)
 
 
 def check_no_policy_from_git(objects, label):
@@ -366,6 +390,56 @@ def check_cnrm_annotations(objects, label):
         if obj["kind"] in DURABLE_KINDS and annotations.get("cnrm.cloud.google.com/deletion-policy") != "abandon":
             missing.append("cnrm.cloud.google.com/deletion-policy: abandon")
         report(not missing, f"  {label}: {obj['kind']} {obj['metadata']['name']} carries its annotations" + (f" (missing {missing})" if missing else ""))
+
+
+# ADR-0022 §5: a platform chart names IAM members literally. An IAM member
+# taken from memberFrom.serviceAccountRef is read from the referenced
+# IAMServiceAccount's status.email [C, k8s-config-connector v1.156.0
+# pkg/controller/iam/iamclient/tfiamclient.go L658-670, L730-744], and a team
+# can write its own objects' /status: RBAC's admin covers the subresource and
+# Kyverno's webhook does not see it. IAMPartialPolicy and IAMPolicy carry the
+# same memberFrom form, and the platform's charts use neither kind.
+IAM_KINDS_NOT_USED = {"IAMPartialPolicy", "IAMPolicy"}
+
+
+def iam_member_problems(objects):
+    problems = []
+    for obj in objects:
+        if obj.get("apiVersion", "").split("/", 1)[0] != "iam.cnrm.cloud.google.com":
+            continue
+        name = f"{obj['kind']} {obj['metadata']['name']}"
+        if obj["kind"] in IAM_KINDS_NOT_USED:
+            problems.append(f"{name}: a kind the platform's charts do not use")
+        elif obj["kind"] == "IAMPolicyMember":
+            spec = obj.get("spec", {})
+            if "memberFrom" in spec or not isinstance(spec.get("member"), str):
+                problems.append(f"{name}: the member must be a literal string, not memberFrom")
+    return problems
+
+
+def check_iam_members_literal(objects, label):
+    problems = iam_member_problems(objects)
+    report(not problems, f"  {label}: every IAM member is named literally (ADR-0022 §5)" + (f": {problems}" if problems else ""))
+
+
+def check_iam_member_rule_can_fail():
+    """The rule has to be seen to refuse (ADR-0019 §4), and the claims chart's
+    grants are not in a real tenant's system render, so the charts' text is
+    scanned too."""
+    bad = {
+        "memberFrom.serviceAccountRef": {"kind": "IAMPolicyMember", "spec": {"memberFrom": {"serviceAccountRef": {"name": "other"}}, "role": "roles/iam.workloadIdentityUser"}},
+        "an IAMPartialPolicy": {"kind": "IAMPartialPolicy", "spec": {}},
+    }
+    for what, obj in bad.items():
+        obj = {"apiVersion": "iam.cnrm.cloud.google.com/v1beta1", "metadata": {"name": "mutant"}, **obj}
+        report(bool(iam_member_problems([obj])), f"the literal-member rule refuses {what}")
+    found = []
+    for folder in (CHARTS / "system", CHARTS / "claims", CHARTS / "route", REPO / "edge"):
+        for path in sorted(folder.rglob("*")) if folder.exists() else []:
+            if path.is_file() and path.suffix in {".yaml", ".tpl"}:
+                text = "\n".join(line for line in path.read_text().splitlines() if not line.lstrip().startswith(("#", "{{/*", "{{- /*")))
+                found += [f"{path.relative_to(REPO)}: {word}" for word in ("memberFrom", "IAMPartialPolicy", "kind: IAMPolicy\n") if word in text + "\n"]
+    report(not found, "no chart uses memberFrom, IAMPartialPolicy or IAMPolicy" + (f": {found}" if found else ""))
 
 
 def check_svc_hello_matches_live(systems, environment):
@@ -675,6 +749,252 @@ def check_edge_apps():
     report(bool(edge_problems(apps, systems_wave, [n for n in reserved if n != "edge"])), "  the edge check catches `edge` missing from the reserved System names")
 
 
+# ---------------------------------------------------------------------------
+# M3a phase 2: the Gateways and the two edge policies (ADR-0021 §4, §9)
+# ---------------------------------------------------------------------------
+
+ARGOCD = ("argocd-application-controller", "argocd")
+NAMESPACE_CONTROLLER = ("namespace-controller", "kube-system")
+GARBAGE_COLLECTOR = ("generic-garbage-collector", "kube-system")
+CLOUD_GROUP_KINDS = {"sql.cnrm.cloud.google.com/*/*", "iam.cnrm.cloud.google.com/*/*", "artifactregistry.cnrm.cloud.google.com/*/*"}
+# The kinds ADR-0021 §9 lists. The GKE group is listed by kind, never whole.
+GKE_POLICY_KINDS = ["GCPBackendPolicy", "HealthCheckPolicy", "GCPGatewayPolicy", "GCPSessionAffinityPolicy", "GCPTrafficDistributionPolicy", "LBPolicy"]
+ROUTE_KIND_SELECTORS = {"networking.k8s.io/*/Ingress", "gateway.networking.k8s.io/*/*"} | {f"networking.gke.io/*/{k}" for k in GKE_POLICY_KINDS}
+LABEL_KEY = "platform.thecloudgeek.io/system"
+
+
+def gateway_problems(objects, environment):
+    """The platform's edge, as ADR-0021 §4 describes it."""
+    env = environment["environment"]
+    problems = []
+    namespaces = [o for o in objects if o["kind"] == "Namespace"]
+    if len(namespaces) != 1 or namespaces[0]["metadata"]["name"] != "edge":
+        problems.append("expected exactly one Namespace, named edge")
+    elif LABEL_KEY in namespaces[0]["metadata"].get("labels", {}):
+        problems.append("the edge namespace carries the System label, which makes it a tenant namespace")
+    elif namespaces[0]["metadata"]["annotations"].get("argocd.argoproj.io/sync-options") != "Prune=false":
+        problems.append("the edge namespace is not Prune=false (ADR-0019 §1)")
+    gateways = {o["metadata"]["name"]: o for o in objects if o["kind"] == "Gateway"}
+    if sorted(gateways) != ["external", "internal"]:
+        problems.append(f"expected Gateways external and internal, found {sorted(gateways)}")
+        return problems
+    wants = {
+        "external": ("gke-l7-global-external-managed", "HTTPS", 443, env["externalAddress"]),
+        "internal": ("gke-l7-rilb", "HTTP", 80, env["internalAddress"]),
+    }
+    for name, (cls, protocol, port, address) in wants.items():
+        gateway = gateways[name]
+        spec = gateway["spec"]
+        if gateway["metadata"].get("namespace") != "edge":
+            problems.append(f"Gateway {name} is not in the edge namespace")
+        if spec["gatewayClassName"] != cls:
+            problems.append(f"Gateway {name} has class {spec['gatewayClassName']}, expected {cls}")
+        if [(a.get("type"), a.get("value")) for a in spec.get("addresses", [])] != [("NamedAddress", address)]:
+            problems.append(f"Gateway {name} must take the NamedAddress {address!r} from the environment")
+        listeners = [(l["protocol"], l["port"]) for l in spec["listeners"]]
+        if listeners != [(protocol, port)]:
+            problems.append(f"Gateway {name} must have one {protocol} listener on {port}, found {listeners}")
+        for listener in spec["listeners"]:
+            allowed = listener.get("allowedRoutes", {}).get("namespaces", {})
+            expressions = allowed.get("selector", {}).get("matchExpressions", [])
+            if allowed.get("from") != "Selector" or expressions != [{"key": LABEL_KEY, "operator": "Exists"}]:
+                problems.append(f"Gateway {name}'s allowedRoutes must select namespaces by {LABEL_KEY} with operator Exists, nothing else")
+        certmap = gateway["metadata"].get("annotations", {}).get("networking.gke.io/certmap")
+        if name == "external" and certmap != "edge-external":
+            problems.append("Gateway external must attach the certificate map edge-external by annotation")
+        if name == "internal" and certmap is not None:
+            problems.append("Gateway internal has no TLS in M3 (ADR-0021 §4) and carries no certificate map")
+    return problems
+
+
+def check_gateways(environment):
+    with tempfile.TemporaryDirectory() as folder:
+        ok, output = render_edge(folder, environment)
+    report(ok, "edge/ renders with the real environment file")
+    if not ok:
+        print(output)
+        return
+    objects = documents(output)
+    found = gateway_problems(objects, environment)
+    report(not found, "  the namespace and the two Gateways are as ADR-0021 §4 says" + (f": {found}" if found else ""))
+
+    def gw(os, name):
+        return next(o for o in os if o["kind"] == "Gateway" and o["metadata"]["name"] == name)
+
+    mutations = {
+        "an external Gateway of the wrong class": lambda os: gw(os, "external")["spec"].update(gatewayClassName="gke-l7-rilb"),
+        "an internal Gateway with HTTPS": lambda os: gw(os, "internal")["spec"]["listeners"][0].update(protocol="HTTPS", port=443),
+        "an external Gateway without the certificate map": lambda os: gw(os, "external")["metadata"]["annotations"].pop("networking.gke.io/certmap"),
+        "an address that is not the environment's": lambda os: gw(os, "internal")["spec"]["addresses"][0].update(value="somewhere-else"),
+        "a Gateway that lets every namespace attach": lambda os: gw(os, "external")["spec"]["listeners"][0]["allowedRoutes"]["namespaces"].update(**{"from": "All"}),
+        "a selector on another key": lambda os: gw(os, "internal")["spec"]["listeners"][0]["allowedRoutes"]["namespaces"]["selector"]["matchExpressions"][0].update(key="kubernetes.io/metadata.name"),
+        "an edge namespace that carries the System label": lambda os: next(o for o in os if o["kind"] == "Namespace")["metadata"].setdefault("labels", {}).update({LABEL_KEY: "edge"}),
+        "a missing Gateway": lambda os: os.remove(gw(os, "internal")),
+    }
+    for what, edit in mutations.items():
+        copied = copy.deepcopy(objects)
+        edit(copied)
+        report(bool(gateway_problems(copied, environment)), f"  the Gateway check catches {what}")
+
+
+def _match_blocks(rule):
+    return [m["resources"] for m in rule["match"]["any"]]
+
+
+def edge_policy_problems(policies):
+    """The two policies of ADR-0021 §9, as that section describes them. Returns
+    the problems found; none means they are right."""
+    problems = []
+    deny_edge = policies.get("deny-edge-objects")
+    label = policies.get("require-system-label")
+    if deny_edge is None or label is None:
+        return ["deny-edge-objects and require-system-label must both exist in kyverno/policies"]
+    for name in ("deny-edge-objects", "require-system-label"):
+        spec = policies[name]["spec"]
+        if spec.get("webhookConfiguration", {}).get("failurePolicy") != "Fail":
+            problems.append(f"{name}: failurePolicy must be Fail")
+        if spec.get("validationFailureAction") != "Enforce":
+            problems.append(f"{name}: validationFailureAction must be Enforce")
+        for rule in spec["rules"]:
+            if set(rule) & {"mutate", "generate", "verifyImages"}:
+                problems.append(f"{name}, rule {rule['name']}: Kyverno here is validate-only (apps/kyverno.yaml)")
+            validate = rule.get("validate") or {}
+            if "deny" not in validate:
+                problems.append(f"{name}, rule {rule['name']}: must be a validate deny")
+            elif validate.get("allowExistingViolations") is not False:
+                problems.append(f"{name}, rule {rule['name']}: allowExistingViolations must be false")
+            selector = [r.get("namespaceSelector") for r in _match_blocks(rule)]
+            want = {"matchExpressions": [{"key": LABEL_KEY, "operator": "Exists"}]}
+            if selector != [want]:
+                problems.append(f"{name}, rule {rule['name']}: must match tenant namespaces by {LABEL_KEY} Exists")
+
+    rules = {r["name"]: r for r in deny_edge["spec"]["rules"]}
+    service = rules.get("no-load-balancer-or-nodeport-services-in-tenant-namespaces")
+    create = rules.get("no-edge-objects-by-hand-in-tenant-namespaces")
+    delete = rules.get("no-edge-object-deletes-by-hand-in-tenant-namespaces")
+    if not (service and create and delete) or len(rules) != 3:
+        return problems + ["deny-edge-objects must have exactly the service, create/update and delete rules"]
+
+    block = _match_blocks(service)[0]
+    if block["kinds"] != ["Service"] or sorted(block["operations"]) != ["CREATE", "UPDATE"]:
+        problems.append("the Service rule must match Service on CREATE and UPDATE")
+    if "exclude" in service:
+        problems.append("the Service rule exempts nobody: the tenant's own Application is Argo CD too (ADR-0021 §9)")
+    conditions = service["validate"]["deny"].get("conditions", {}).get("any", [])
+    if len(conditions) != 1 or sorted(conditions[0].get("value", [])) != ["LoadBalancer", "NodePort"] or "request.object.spec.type" not in conditions[0].get("key", ""):
+        problems.append("the Service rule must deny exactly type LoadBalancer and NodePort")
+
+    for rule, operations, exempt in (
+        # The garbage collector on UPDATE removes the foregroundDeletion
+        # finalizer an Argo CD prune leaves; refused, a removed route would stay
+        # terminating (the M3 readiness note's correction of 2026-10-27).
+        (create, ["CREATE", "UPDATE"], {ARGOCD, GARBAGE_COLLECTOR}),
+        (delete, ["DELETE"], {ARGOCD, NAMESPACE_CONTROLLER, GARBAGE_COLLECTOR}),
+    ):
+        block = _match_blocks(rule)[0]
+        if set(block["kinds"]) != ROUTE_KIND_SELECTORS:
+            problems.append(f"rule {rule['name']}: kinds must be Ingress, gateway.networking.k8s.io/*/* and the listed GKE kinds by name, found {sorted(block['kinds'])}")
+        if any(k.split("/", 1)[0] == "networking.gke.io" and k.rsplit("/", 1)[1] in ("*", "") for k in block["kinds"]):
+            problems.append(f"rule {rule['name']}: the networking.gke.io group is listed by kind, never whole (ADR-0021 §9)")
+        if sorted(block["operations"]) != operations:
+            problems.append(f"rule {rule['name']}: operations must be {operations}")
+        subjects = {(s["name"], s["namespace"]) for e in rule.get("exclude", {}).get("any", []) for s in e.get("subjects", [])}
+        if subjects != exempt or any(s.get("kind") != "ServiceAccount" for e in rule["exclude"]["any"] for s in e["subjects"]):
+            problems.append(f"rule {rule['name']}: exempt exactly {sorted(exempt)}, found {sorted(subjects)}")
+
+    label_rules = {r["name"]: r for r in label["spec"]["rules"]}
+    cloud = label_rules.get("cloud-objects-carry-the-system-label")
+    routes = label_rules.get("route-objects-carry-the-system-label")
+    if not (cloud and routes) or len(label_rules) != 2:
+        return problems + ["require-system-label must have exactly the cloud and route rules"]
+    for rule, kinds in ((cloud, CLOUD_GROUP_KINDS), (routes, ROUTE_KIND_SELECTORS)):
+        block = _match_blocks(rule)[0]
+        if set(block["kinds"]) != kinds:
+            problems.append(f"rule {rule['name']}: kinds must be {sorted(kinds)}, found {sorted(block['kinds'])}")
+        if sorted(block["operations"]) != ["CREATE", "UPDATE"]:
+            problems.append(f"rule {rule['name']}: operations must be CREATE and UPDATE")
+        if "exclude" in rule:
+            problems.append(f"rule {rule['name']}: exempts nobody")
+        conditions = rule["validate"]["deny"].get("conditions", {}).get("any", [])
+        if len(conditions) != 1 or LABEL_KEY not in conditions[0].get("key", "") or conditions[0].get("operator") != "NotEquals" or conditions[0].get("value") != "{{ request.namespace }}":
+            problems.append(f"rule {rule['name']}: must deny when the label {LABEL_KEY} does not equal the namespace")
+    # The cloud kinds the label rule gates are the ones deny-raw gates.
+    raw = policies.get("deny-raw-cloud-resources")
+    if raw is not None:
+        raw_kinds = set(_match_blocks(raw["spec"]["rules"][0])[0]["kinds"])
+        if raw_kinds != CLOUD_GROUP_KINDS:
+            problems.append(f"deny-raw-cloud-resources gates {sorted(raw_kinds)}; the label rule gates {sorted(CLOUD_GROUP_KINDS)} (ADR-0017 §7)")
+    return problems
+
+
+def check_edge_policies():
+    policies = {}
+    for path in sorted((REPO / "kyverno" / "policies").glob("*.yaml")):
+        for doc in documents(path.read_text()):
+            if doc["kind"] == "ClusterPolicy":
+                policies[doc["metadata"]["name"]] = doc
+    found = edge_policy_problems(policies)
+    report(not found, "kyverno/policies: deny-edge-objects and require-system-label are as ADR-0021 §9 says" + (f": {found}" if found else ""))
+
+    def rule(ps, policy, name):
+        return next(r for r in ps[policy]["spec"]["rules"] if r["name"] == name)
+
+    service = "no-load-balancer-or-nodeport-services-in-tenant-namespaces"
+    create = "no-edge-objects-by-hand-in-tenant-namespaces"
+    delete = "no-edge-object-deletes-by-hand-in-tenant-namespaces"
+    cloud = "cloud-objects-carry-the-system-label"
+    routes = "route-objects-carry-the-system-label"
+    mutations = {
+        "a Service rule that exempts Argo CD": lambda ps: rule(ps, "deny-edge-objects", service).update(exclude={"any": [{"subjects": [{"kind": "ServiceAccount", "name": "argocd-application-controller", "namespace": "argocd"}]}]}),
+        "a Service rule that also lets NodePort through": lambda ps: rule(ps, "deny-edge-objects", service)["validate"]["deny"]["conditions"]["any"][0].update(value=["LoadBalancer"]),
+        "a create rule that exempts the namespace controller": lambda ps: rule(ps, "deny-edge-objects", create)["exclude"]["any"][0]["subjects"].append({"kind": "ServiceAccount", "name": NAMESPACE_CONTROLLER[0], "namespace": NAMESPACE_CONTROLLER[1]}),
+        "a create rule that refuses the garbage collector": lambda ps: rule(ps, "deny-edge-objects", create)["exclude"]["any"][0]["subjects"].pop(),
+        "a delete rule that refuses the garbage collector": lambda ps: rule(ps, "deny-edge-objects", delete)["exclude"]["any"][0]["subjects"].pop(),
+        "a whole networking.gke.io group": lambda ps: rule(ps, "deny-edge-objects", create)["match"]["any"][0]["resources"]["kinds"].append("networking.gke.io/*/*"),
+        "a missing GKE kind": lambda ps: rule(ps, "deny-edge-objects", delete)["match"]["any"][0]["resources"]["kinds"].remove("networking.gke.io/*/LBPolicy"),
+        "a missing Ingress": lambda ps: rule(ps, "deny-edge-objects", create)["match"]["any"][0]["resources"]["kinds"].remove("networking.k8s.io/*/Ingress"),
+        "a deny that lets an edit through": lambda ps: rule(ps, "deny-edge-objects", create)["validate"].pop("allowExistingViolations"),
+        "a label deny that lets an edit through": lambda ps: rule(ps, "require-system-label", routes)["validate"].update(allowExistingViolations=True),
+        "a policy that fails open": lambda ps: ps["deny-edge-objects"]["spec"]["webhookConfiguration"].update(failurePolicy="Ignore"),
+        "a mutating rule": lambda ps: rule(ps, "require-system-label", cloud).update(mutate={}),
+        "a label rule that compares with another value": lambda ps: rule(ps, "require-system-label", cloud)["validate"]["deny"]["conditions"]["any"][0].update(value="svc-hello"),
+        "a label rule that leaves out a route kind": lambda ps: rule(ps, "require-system-label", routes)["match"]["any"][0]["resources"]["kinds"].remove("gateway.networking.k8s.io/*/*"),
+        "a label rule on a different set of cloud kinds": lambda ps: rule(ps, "require-system-label", cloud)["match"]["any"][0]["resources"]["kinds"].pop(),
+        "a rule that reaches platform namespaces": lambda ps: rule(ps, "deny-edge-objects", delete)["match"]["any"][0]["resources"].pop("namespaceSelector"),
+        "a missing policy": lambda ps: ps.pop("require-system-label"),
+    }
+    for what, edit in mutations.items():
+        copied = copy.deepcopy(policies)
+        edit(copied)
+        report(bool(edge_policy_problems(copied)), f"  the policy check catches {what}")
+
+
+def blacklist_problems(blacklist):
+    """The git half of ADR-0021 §9: the tenant AppProject refuses the Ingress,
+    every Gateway API kind and the GKE networking group."""
+    want = {("networking.k8s.io", "Ingress"), ("gateway.networking.k8s.io", "*"), ("networking.gke.io", "*")}
+    return [f"{g}/{k}" for g, k in sorted(want - set(blacklist))]
+
+
+def check_no_edge_from_git(objects, label):
+    projects = [o for o in objects if o["kind"] == "AppProject"]
+    blacklist = set()
+    if len(projects) == 1:
+        blacklist = {(e.get("group"), e.get("kind")) for e in projects[0]["spec"].get("namespaceResourceBlacklist", [])}
+    missing = blacklist_problems(blacklist)
+    report(not missing, f"  {label}: its AppProject refuses Ingress, Gateway API and GKE networking kinds from git" + (f" (missing {missing})" if missing else ""))
+
+
+def check_edge_git_door_can_fail():
+    """The AppProject half of item 14 can fail: take each entry out of a
+    blacklist that has all of them and the check must name it."""
+    full = {("networking.k8s.io", "Ingress"), ("gateway.networking.k8s.io", "*"), ("networking.gke.io", "*")}
+    report(not blacklist_problems(full), "the git-door check passes a blacklist that has all three entries")
+    for entry in sorted(full):
+        found = blacklist_problems(full - {entry})
+        report(found == [f"{entry[0]}/{entry[1]}"], f"  the git-door check names {entry[0]}/{entry[1]} when it is missing")
+
+
 def check_policies():
     """The reality gate refuses an edit too (ADR-0017 §7).
 
@@ -769,6 +1089,8 @@ def main():
     check_tenant_values_change_nothing(environment)
     print("\n== the real tenant files")
     check_real_tenants(args.systems, environment)
+    print("\n== IAM members are named literally (ADR-0022 §5)")
+    check_iam_member_rule_can_fail()
     print("\n== svc-hello's database renders what is live")
     check_svc_hello_matches_live(args.systems, environment)
     print("\n== the root app-of-apps")
@@ -779,6 +1101,11 @@ def main():
     check_route_file_cannot_set_platform(environment)
     print("\n== the edge Applications")
     check_edge_apps()
+    print("\n== the Gateways")
+    check_gateways(environment)
+    print("\n== the edge policies, and the git door")
+    check_edge_policies()
+    check_edge_git_door_can_fail()
     print("\n== the reality gate refuses an edit too")
     check_policies()
     print("\n== a team cannot write Kyverno policy with kubectl")

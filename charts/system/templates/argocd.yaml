@@ -62,6 +62,25 @@ spec:
       kind: "*"
     - group: "policies.kyverno.io"
       kind: "*"
+    # A tenant cannot reach a load balancer through git except through the
+    # platform's Gateways (ADR-0021 §9). An Ingress, any Gateway API kind and
+    # any kind of GKE's networking group are the platform's, written by the
+    # `edge` project; the Kyverno policy deny-edge-objects refuses the Ingress,
+    # Gateway API and GKE gateway policy kinds from kubectl. The group is
+    # blacklisted whole HERE, though deny-edge-objects names its GKE kinds one
+    # by one: GKE's own controllers write ServiceNetworkEndpointGroup objects
+    # into a Service's namespace, and an admission rule that matched the group
+    # would refuse them, but they are never in a tenant's k8s/, so a whole-group
+    # entry costs this project nothing. It also keeps a team from writing its
+    # own FQDNNetworkPolicy through git (ADR-0021, Consequences). A Service of
+    # type LoadBalancer or NodePort cannot be told apart by kind;
+    # deny-edge-objects is its only wall.
+    - group: "networking.k8s.io"
+      kind: Ingress
+    - group: "gateway.networking.k8s.io"
+      kind: "*"
+    - group: "networking.gke.io"
+      kind: "*"
   roles:
     # Inert until Argo CD has single sign-on. Argo CD groups come from its own
     # login's groups claim, not from GKE's Google Groups, and no login carries

@@ -1,0 +1,66 @@
+{{- $external := include "edge.env" (list .Values "externalAddress") }}
+{{- $internal := include "edge.env" (list .Values "internalAddress") }}
+---
+# The external Gateway: a global external Application Load Balancer, on a
+# reserved global static IP, HTTPS on 443 (ADR-0021 §4). The wildcard
+# certificate comes from a Certificate Manager map, attached by the annotation
+# below and not by a listener `tls` block [I: the GKE Gateway documentation
+# describes the annotation; the first external route records that it works
+# with a wildcard entry, C-13]. The map `edge-external` and its one entry are
+# layer-1 Terraform (ADR-0021 §6, §12).
+#
+# allowedRoutes: only a namespace that carries the system label may attach a
+# route. That label is on every namespace charts/system creates and on no
+# platform namespace, `edge` included. It is one of three walls around "any
+# namespace" in the `edge` project (the other two are the `require-system-label`
+# policy and the AppProject itself, ADR-0021 §3).
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: external
+  namespace: edge
+  annotations:
+    networking.gke.io/certmap: edge-external
+spec:
+  gatewayClassName: gke-l7-global-external-managed
+  addresses:
+    - type: NamedAddress
+      value: {{ $external | quote }}
+  listeners:
+    - name: https
+      protocol: HTTPS
+      port: 443
+      allowedRoutes:
+        namespaces:
+          from: Selector
+          selector:
+            matchExpressions:
+              - key: platform.thecloudgeek.io/system
+                operator: Exists
+---
+# The internal Gateway: a regional internal Application Load Balancer, on a
+# reserved regional internal IP, HTTP on 80 only. Internal TLS is out of M3
+# and recorded as such (ADR-0021 §4): traffic to an internal route is plain
+# HTTP between the client and the load balancer. The regional internal load
+# balancer needs a proxy-only subnet in the VPC, a layer-1 resource.
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: internal
+  namespace: edge
+spec:
+  gatewayClassName: gke-l7-rilb
+  addresses:
+    - type: NamedAddress
+      value: {{ $internal | quote }}
+  listeners:
+    - name: http
+      protocol: HTTP
+      port: 80
+      allowedRoutes:
+        namespaces:
+          from: Selector
+          selector:
+            matchExpressions:
+              - key: platform.thecloudgeek.io/system
+                operator: Exists
