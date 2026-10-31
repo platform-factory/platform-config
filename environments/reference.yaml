@@ -100,6 +100,5 @@ environment:
   # default `latest` would move with the cluster's upgrades and change what
   # `baseline` and `restricted` mean without a pull request. Set it to the
   # cluster's minor when the cluster is rebuilt (`kubectl version`).
-  # [I: no cluster version is recorded yet; v1.35 is a placeholder for the
-  # REGULAR channel, to be read from the rebuilt cluster before C-34 runs.]
-  podSecurityVersion: v1.35
+  # Read from the rebuilt cluster on 2026-10-31: 1.36.4-gke.2046003.
+  podSecurityVersion: v1.36
