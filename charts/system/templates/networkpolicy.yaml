@@ -65,6 +65,22 @@ spec:
           port: 53
         - protocol: TCP
           port: 53
+    # NodeLocal DNSCache: on this cluster a pod's DNS is answered by the
+    # node-local-dns pod on its node, not kube-dns. Without this rule every name
+    # lookup fails: a new pod's Auth Proxy cannot start and the GRANT Job cannot
+    # find its instance. C-34's first run found it (M3, 2026-10-31).
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: node-local-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
     # The GKE metadata server: Workload Identity tokens on Dataplane V2 (Google's
     # GKE network-policy page, per platform-config#21). Without it the Auth Proxy
     # cannot log in and /healthz goes red.

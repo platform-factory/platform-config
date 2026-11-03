@@ -43,9 +43,15 @@ spec:
         - path:
             type: PathPrefix
             value: {{ .Values.path | default "/" | quote }}
+      # group, kind and weight are the API server's defaults, written out. Left out,
+      # Argo CD's server-side-apply comparison reports the route OutOfSync forever
+      # and `cycle.sh up` times out on it (M3's rebuild, 2026-10-31).
       backendRefs:
-        - name: {{ .Values.service | quote }}
+        - group: ""
+          kind: Service
+          name: {{ .Values.service | quote }}
           port: {{ .Values.port }}
+          weight: 1
 {{- if eq $exposure "external" }}
 ---
 # Cloud Armor, attached through the Service (ADR-0021 §7). GKE attaches one
