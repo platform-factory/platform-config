@@ -43,6 +43,7 @@ writes every key of both, so a `claims.yaml` that sets `system.tier` or
 | `SQLInstance` | `<system>-<claim>` | yes |
 | `SQLDatabase` | `<system>-<claim>-app` (database `app`) | yes |
 | `SQLUser` | `<system>-<claim>-iam-user` (user `<system>@<project>.iam`) | yes |
+| `IAMPolicyMember` ×4 | `<system>-<claim>-sql-client-app`, `-sql-client-team-<team>`, `-sql-instance-user-app`, `-sql-instance-user-team-<team>` | no |
 | `ConfigMap` | `<claim>-connection` | no |
 | `Job` | `<claim>-seed-<hash>`: creates `<claim>-admin` once | no |
 | `Job` | `<claim>-grant-<hash>`: gives the IAM user its privileges | no |

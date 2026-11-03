@@ -56,7 +56,7 @@ never against a live cluster.
 | `Application` `<name>` | `argocd` | the service repo's `k8s/`, under the project above |
 | `Application` `<name>-claims` | `argocd` | the service's `claims.yaml`, rendered by charts/claims in the platform's project |
 | `IAMServiceAccount` `<name>` | `<name>` | `<name>@<project>.iam.gserviceaccount.com` |
-| `IAMPolicyMember` ×6 | `<name>` | Workload Identity; Cloud SQL client and instance user for the app and for the team; registry writer for the team |
+| `IAMPolicyMember` ×2 | `<name>` | Workload Identity; registry writer for the team. The Cloud SQL grants are charts/claims': one conditioned pair per database (ADR-0021 §14) |
 | `ArtifactRegistryRepository` `<name>` | `<name>` | durable: abandoned, never deleted, by the engine |
 
 ## Moving a System to another team
